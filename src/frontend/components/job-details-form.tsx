@@ -4,7 +4,7 @@ import type React from "react"
 
 import { useState } from "react"
 import { useRouter } from "next/navigation"
-import { Car, FileText, Plus, Trash2, X } from "lucide-react"
+import { Car, FileText, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -74,10 +74,8 @@ export function JobDetailsForm() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!validateForm()) {
-      toast({
-        title: "Validation Error",
+      toast.error("Validation Error", {
         description: "Please fill in all required fields.",
-        variant: "destructive",
       })
       return
     }
@@ -85,10 +83,8 @@ export function JobDetailsForm() {
 
     const validWorkItems = workItems.filter((item) => item.description.trim() !== "")
     if (validWorkItems.length === 0) {
-      toast({
-        title: "Validation Error",
+      toast.error("Validation Error", {
         description: "Please add at least one valid work item description.",
-        variant: "destructive",
       })
       setIsSubmitting(false)
       return
@@ -112,7 +108,9 @@ export function JobDetailsForm() {
         let errorBody = "Could not retrieve error details."
         try {
           errorBody = await response.text()
-        } catch (_) {}
+        } catch (fetchError) {
+          console.warn("Could not parse error response body:", fetchError)
+        }
         console.error("Analysis API Error:", response.status, errorBody)
         throw new Error(`Failed to analyze job details (Status: ${response.status}). ${errorBody.substring(0, 100)}`)
       }
@@ -130,10 +128,8 @@ export function JobDetailsForm() {
         console.log("Combined chatPageData saved to sessionStorage:", sessionStorage.getItem("chatPageData"))
       } catch (storageError) {
         console.error("Failed to save chatPageData to sessionStorage:", storageError)
-        toast({
-          title: "Error",
+        toast.error("Error", {
           description: "Could not save job data locally. Please try again.",
-          variant: "destructive",
         })
         setIsSubmitting(false)
         return
@@ -143,10 +139,8 @@ export function JobDetailsForm() {
 
     } catch (error) {
       console.error("Form submission error:", error)
-      toast({
-        title: "Submission Error",
+      toast.error("Submission Error", {
         description: error instanceof Error ? error.message : "An unexpected error occurred.",
-        variant: "destructive",
       })
     } finally {
       setIsSubmitting(false)

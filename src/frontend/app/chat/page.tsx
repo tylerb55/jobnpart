@@ -7,12 +7,12 @@ import { CarPartsChat } from "@/components/car-parts-chat"
 import { Skeleton } from "@/components/ui/skeleton"
 import Link from "next/link"
 // Import the type for the data structure we expect
-import { ChatPageData } from "@/app/types" // Adjust path if needed
+import { ChatPageData, JobDetailsForChat, PartsData } from "@/app/types" // Adjust path if needed
 
 export default function ChatPage() {
   // State to hold the different parts of the data
-  const [initialJobData, setInitialJobData] = useState<any>(null) // Use specific type if JobDetails type is available
-  const [initialPartsDataList, setInitialPartsDataList] = useState<any[] | null>(null) // Use PartsData[] type
+  const [initialJobData, setInitialJobData] = useState<JobDetailsForChat | null>(null)
+  const [initialPartsDataList, setInitialPartsDataList] = useState<PartsData[] | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -40,18 +40,22 @@ export default function ChatPage() {
           // Comment this out temporarily if still debugging sessionStorage issues
           //sessionStorage.removeItem("chatPageData")
 
-        } catch (parseError: any) {
+        } catch (parseError: unknown) {
           console.error("Error parsing chatPageData from sessionStorage:", parseError)
-          errorMessage = `Failed to read job data. It might be corrupted. (${parseError.message})`
+          errorMessage = `Failed to read job data. It might be corrupted. (${
+            parseError instanceof Error ? parseError.message : String(parseError)
+          })`
           parsedPageData = null // Ensure data is null if parsing fails
         }
       } else {
         console.warn("No chatPageData found in sessionStorage.")
         errorMessage = "Job data not found. Please start from the job form again."
       }
-    } catch (storageError: any) {
+    } catch (storageError: unknown) {
       console.error("Error accessing sessionStorage:", storageError)
-      errorMessage = `Could not access session storage. Please ensure it is enabled. (${storageError.message})`
+      errorMessage = `Could not access session storage. Please ensure it is enabled. (${
+        storageError instanceof Error ? storageError.message : String(storageError)
+      })`
     }
 
     // Set state based on the parsed data

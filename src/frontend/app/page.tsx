@@ -1,4 +1,3 @@
-import { JobDetailsForm } from "@/components/job-details-form"
 import { JobSheet } from "@/components/job-sheet"
 
 export default function Home() {

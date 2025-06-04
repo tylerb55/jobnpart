@@ -10,7 +10,7 @@ export function SearchingIndicator({ query, source }: SearchingIndicatorProps) {
     <div className="flex items-center gap-2 text-sm text-gray-500">
       <Loader2 className="h-4 w-4 animate-spin" />
       <span>
-        Searching {source} for "{query}"...
+        Searching {source} for &quot;{query}&quot;...
       </span>
     </div>
   )

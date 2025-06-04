@@ -165,7 +165,7 @@ export function ChatContainer({ job, addPartToJob, updateRepairCategory, initial
     }
 
     setMessages(initialMessages)
-  }, [job])
+  }, [job, initialPartNumber])
 
   // Scroll to bottom when messages change
   useEffect(() => {
@@ -405,15 +405,15 @@ export function ChatContainer({ job, addPartToJob, updateRepairCategory, initial
           } else if (message.type === "options") {
             return <ChatOptions key={index} options={message.options} onSelect={handleOptionSelect} />
           } else if (message.type === "part") {
-            return <PartCard key={index} part={message.part} onAddToJob={handleAddPart} />
+            return <PartCard key={index} part={{ ...message.part, partName: message.part.name, partNumber: message.part.number }} onAddToJob={() => handleAddPart(message.part)} />
           } else if (message.type === "parts") {
             return (
               <div key={index} className="space-y-3">
                 {message.parts.map((part, partIndex) => (
                   <PartCard
                     key={`${index}-${partIndex}`}
-                    part={part}
-                    onAddToJob={handleAddPart}
+                    part={{ ...part, partName: part.name, partNumber: part.number }}
+                    onAddToJob={() => handleAddPart(part)}
                     isRecommended={partIndex === 0}
                   />
                 ))}
