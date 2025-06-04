@@ -149,7 +149,7 @@ export function JobSheet() {
         workItems: simplifiedWorkItems,
       }
 
-      const response = await fetch(`http://localhost:8000/${endpoint}`, {
+      const response = await fetch(`https://jobnpart.onrender.com/${endpoint}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -212,7 +212,7 @@ export function JobSheet() {
     }
 
     try {
-      const response = await fetch("http://localhost:8000/analyse-job", {
+      const response = await fetch("https://jobnpart.onrender.com/analyse-job", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(analysisSubmissionData),
