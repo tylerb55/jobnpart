@@ -4,15 +4,10 @@ import { Trash2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card } from "@/components/ui/card"
+import { JobPart } from "@/app/types"
 
 interface JobPartsListProps {
-  parts: Array<{
-    partName: string
-    partNumber: string
-    price?: number
-    quantity: number
-    source: string
-  }>
+  parts: JobPart[]
   updateQuantity: (partNumber: string, quantity: number) => void
 }
 
@@ -34,12 +29,12 @@ export function JobPartsList({ parts, updateQuantity }: JobPartsListProps) {
     <div className="p-4">
       <div className="space-y-3">
         {parts.map((part) => (
-          <Card key={part.partNumber} className="p-3">
+          <Card key={part.number} className="p-3">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
               <div>
-                <div className="font-medium">{part.partName}</div>
+                <div className="font-medium">{part.name}</div>
                 <div className="text-sm text-gray-500">
-                  {part.partNumber} • {part.source}
+                  {part.number} • {part.source}
                 </div>
               </div>
 
@@ -51,21 +46,21 @@ export function JobPartsList({ parts, updateQuantity }: JobPartsListProps) {
                     variant="outline"
                     size="icon"
                     className="h-8 w-8 rounded-r-none"
-                    onClick={() => updateQuantity(part.partNumber, part.quantity - 1)}
+                    onClick={() => updateQuantity(part.number, part.quantity - 1)}
                   >
                     -
                   </Button>
                   <Input
                     type="number"
                     value={part.quantity}
-                    onChange={(e) => updateQuantity(part.partNumber, Number.parseInt(e.target.value) || 0)}
+                    onChange={(e) => updateQuantity(part.number, Number.parseInt(e.target.value) || 0)}
                     className="h-8 w-12 rounded-none text-center [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                   />
                   <Button
                     variant="outline"
                     size="icon"
                     className="h-8 w-8 rounded-l-none"
-                    onClick={() => updateQuantity(part.partNumber, part.quantity + 1)}
+                    onClick={() => updateQuantity(part.number, part.quantity + 1)}
                   >
                     +
                   </Button>
@@ -75,7 +70,7 @@ export function JobPartsList({ parts, updateQuantity }: JobPartsListProps) {
                   variant="ghost"
                   size="icon"
                   className="h-8 w-8 text-gray-500 hover:text-red-500"
-                  onClick={() => updateQuantity(part.partNumber, 0)}
+                  onClick={() => updateQuantity(part.number, 0)}
                 >
                   <Trash2 className="h-4 w-4" />
                 </Button>

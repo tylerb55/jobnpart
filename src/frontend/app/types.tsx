@@ -16,13 +16,21 @@ export interface WorkItem {
     };
     repairCategory: string;
     workItems: WorkItem[];
+    analyzedData?: { // Added optional to align with its usage in CarPartsChatProps
+      suggestedCategories: string[];
+      potentialParts: Part[]; // Changed from any[] to Part[]
+      urgency: string;
+    };
   }
   
   export interface Part {
     id?: string;
     nameId?: string;
-    name?: string;
-    number?: string; // This seems to be the unique identifier used as 'partNumber'
+    name: string;
+    number: string;
+    category: string;
+    source: string;
+    price?: number;
     notice?: string;
     description?: string;
     positionNumber?: string;
@@ -66,3 +74,6 @@ export interface WorkItem {
     };
     partsDataList: PartsData[]; // The list returned from the backend
   }
+
+// Add the export for JobDetailsForChat using the structure from ChatPageData.jobDetails
+export type JobDetailsForChat = ChatPageData['jobDetails'];

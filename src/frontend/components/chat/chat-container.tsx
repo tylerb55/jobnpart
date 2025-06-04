@@ -9,32 +9,30 @@ import { ChatOptions } from "./chat-options"
 import { PartCard } from "../parts/part-card"
 import { CategorySelector } from "../parts/category-selector"
 import { SearchingIndicator } from "./searching-indicator"
+import { Part } from "@/app/types"
 
 // Mock data for parts
-const mockParts = [
+const mockParts: Part[] = [
   {
-    partName: "Front Brake Pads",
-    partNumber: "BP-1234-VW",
+    name: "Front Brake Pads",
+    number: "BP-1234-VW",
     price: 45.99,
-    stock: "In Stock",
+    category: "Brakes",
     source: "SES Part Factors",
-    compatibility: "Compatible with your vehicle",
   },
   {
-    partName: "Front Brake Discs (Pair)",
-    partNumber: "BD-5678-VW",
+    name: "Front Brake Discs (Pair)",
+    number: "BD-5678-VW",
     price: 89.99,
-    stock: "In Stock",
+    category: "Brakes",
     source: "SES Part Factors",
-    compatibility: "Compatible with your vehicle",
   },
   {
-    partName: "Brake Caliper Repair Kit",
-    partNumber: "BC-9012-VW",
+    name: "Brake Caliper Repair Kit",
+    number: "BC-9012-VW",
     price: 32.5,
-    stock: "2-3 days",
+    category: "Brakes",
     source: "SES Part Factors",
-    compatibility: "Compatible with your vehicle",
   },
 ]
 
@@ -53,15 +51,11 @@ interface ChatContainerProps {
     }>
     analyzedData?: {
       suggestedCategories: string[]
-      potentialParts: Array<{
-        partName: string
-        partNumber: string
-        category: string
-      }>
+      potentialParts: Part[]
       urgency: string
     }
   }
-  addPartToJob: (part: any) => void
+  addPartToJob: (part: Part) => void
   updateRepairCategory: (category: string) => void
   initialPartNumber?: string | null
 }
@@ -69,8 +63,8 @@ interface ChatContainerProps {
 type MessageType =
   | { type: "text"; content: string; sender: "system" | "user" }
   | { type: "options"; options: Array<{ label: string; value: string }> }
-  | { type: "part"; part: any }
-  | { type: "parts"; parts: any[] }
+  | { type: "part"; part: Part }
+  | { type: "parts"; parts: Part[] }
   | { type: "categories" }
   | { type: "input"; placeholder: string }
   | { type: "searching"; query: string; source: string }
@@ -129,18 +123,9 @@ export function ChatContainer({ job, addPartToJob, updateRepairCategory, initial
       })
 
       // Convert potential parts to part cards
-      const suggestedParts = job.analyzedData.potentialParts.map((part) => ({
-        partName: part.partName,
-        partNumber: part.partNumber,
-        price: Math.round(Math.random() * 100 + 20) + 0.99, // Random price for demo
-        stock: "In Stock",
-        source: "SES Part Factors",
-        compatibility: "Compatible with your vehicle",
-      }))
-
       initialMessages.push({
         type: "parts",
-        parts: suggestedParts,
+        parts: job.analyzedData.potentialParts,
       })
     }
 
@@ -375,26 +360,25 @@ export function ChatContainer({ job, addPartToJob, updateRepairCategory, initial
         {
           type: "part",
           part: {
-            partName: "Original VW Brake Pads",
-            partNumber: "BP-1234-VW-OEM",
+            name: "Original VW Brake Pads",
+            number: "BP-1234-VW-OEM",
             price: 69.99,
-            stock: "Available to order",
+            category: "Brakes",
             source: "Partlink24 (OEM)",
-            compatibility: "Compatible with your vehicle",
           },
         },
       ])
     }, 3000)
   }
 
-  const handleAddPart = (part: any) => {
+  const handleAddPart = (part: Part) => {
     addPartToJob(part)
 
     setMessages((prev) => [
       ...prev,
       {
         type: "text",
-        content: `Added ${part.partName} (${part.partNumber}) to Job ${job.id}.`,
+        content: `Added ${part.name} (${part.number}) to Job ${job.id}.`,
         sender: "system",
       },
       {

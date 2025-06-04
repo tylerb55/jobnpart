@@ -2,7 +2,7 @@
 
 // Add useMemo for data processing
 import { useState, useRef, useEffect, SyntheticEvent, useMemo } from "react";
-import { PartsData, Position, Part } from "@/app/types" // Make sure Part type is imported/defined
+import { PartsData, Part } from "@/app/types" // Make sure Part type is imported/defined
 import Image from "next/image";
 
 // ... imports ...
@@ -10,6 +10,7 @@ import Image from "next/image";
 interface DiagramViewerProps {
   diagramData: PartsData | null
   onConfirmSelection: (selectedPartIds: string[]) => void
+  onHotspotSelect: (positionNumber: string) => void;
 }
 
 interface CollapsibleSectionProps {
@@ -41,7 +42,7 @@ const CollapsibleSection: React.FC<CollapsibleSectionProps> = ({ title, children
   );
 };
 
-export function DiagramViewer({ diagramData, onConfirmSelection }: DiagramViewerProps) {
+export function DiagramViewer({ diagramData, onConfirmSelection, onHotspotSelect }: DiagramViewerProps) {
   // ... state variables (renderedSize, originalSize, isLoadingOriginalSize, expandedPositions, selectedPartIds) ...
   const [renderedSize, setRenderedSize] = useState<{ width: number; height: number } | null>(null);
   const [originalSize, setOriginalSize] = useState<{ width: number; height: number } | null>(null);
@@ -148,6 +149,7 @@ export function DiagramViewer({ diagramData, onConfirmSelection }: DiagramViewer
 
   // ... handleHotspotClick ...
   const handleHotspotClick = (positionNumber: string) => {
+    onHotspotSelect(positionNumber); // Call the prop
     // Expand the section
     if (!expandedPositions[positionNumber]) {
         togglePositionExpansion(positionNumber);
@@ -297,27 +299,31 @@ export function DiagramViewer({ diagramData, onConfirmSelection }: DiagramViewer
                     onToggle={() => togglePositionExpansion(positionNumber)}
                 >
                     {partsList.map((part) => {
-                        const isSelected = selectedPartIds.has(part.number); // Use part.number (ID)
+                        if (typeof part.number !== 'string') {
+                            return null; 
+                        }
+                        const currentPartNumber = part.number; // Explicitly string here
+                        const isSelected = selectedPartIds.has(currentPartNumber);
                         return (
-                            <div key={part.number} className="py-2 px-1 mb-2 border-b border-gray-100 last:border-b-0 hover:bg-gray-50 rounded">
+                            <div key={currentPartNumber} className="py-2 px-1 mb-2 border-b border-gray-100 last:border-b-0 hover:bg-gray-50 rounded">
                                 <div className="flex justify-between items-start gap-3">
                                     <div>
                                         <p className="font-medium text-sm text-gray-800">
                                             {part.name} {part.notice && <span className="text-gray-500 text-xs">({part.notice})</span>}
                                         </p>
-                                        <p className="text-xs text-gray-600 mt-1">Part No: <span className="font-mono bg-gray-100 px-1 rounded">{part.number}</span></p>
+                                        <p className="text-xs text-gray-600 mt-1">Part No: <span className="font-mono bg-gray-100 px-1 rounded">{currentPartNumber}</span></p>
                                         {part.description && (
                                             <p className="text-xs text-gray-500 mt-1 whitespace-pre-wrap">{part.description}</p>
                                         )}
                                     </div>
                                     <button
-                                        onClick={() => togglePartSelection(part.number)}
+                                        onClick={() => togglePartSelection(currentPartNumber)}
                                         className={`py-1 px-3 text-xs rounded transition-colors ${
                                             isSelected
                                                 ? 'bg-red-100 text-red-700 hover:bg-red-200'
                                                 : 'bg-blue-100 text-blue-700 hover:bg-blue-200'
                                         }`}
-                                        title={isSelected ? `Deselect part ${part.number}` : `Select part ${part.number}`}
+                                        title={isSelected ? `Deselect part ${currentPartNumber}` : `Select part ${currentPartNumber}`}
                                     >
                                         {isSelected ? 'Deselect' : 'Select'}
                                     </button>

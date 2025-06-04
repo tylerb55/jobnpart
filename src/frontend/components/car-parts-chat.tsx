@@ -19,7 +19,7 @@ interface CarPartsChatProps {
     year: string;
     analyzedData?: {
         suggestedCategories: string[];
-        potentialParts: any[];
+        potentialParts: Part[];
         urgency: string;
     };
   } | null;
@@ -80,6 +80,12 @@ export function CarPartsChat({ initialJobData, initialPartsDataList }: CarPartsC
 
   const [currentView, setCurrentView] = useState<ChatView>('chat');
   const [selectedPartNumber, setSelectedPartNumber] = useState<string | null>(null);
+
+  // Placeholder for onConfirmSelection prop
+  const handleConfirmPartSelection = (selectedPartIds: string[]) => {
+    console.log("Confirmed selected part IDs:", selectedPartIds);
+    // TODO: Implement logic to handle confirmed parts (e.g., add to job, etc.)
+  };
 
   useEffect(() => {
     console.log("CarPartsChat Props Received:", { initialJobData, initialPartsDataList });
@@ -153,7 +159,7 @@ export function CarPartsChat({ initialJobData, initialPartsDataList }: CarPartsC
       for (const group of diagramToView.partGroups) {
         const foundPart = group.parts.find(part => part.positionNumber === positionNumber);
         if (foundPart) {
-          foundPartNumber = foundPart.number;
+          foundPartNumber = foundPart.number || null;
           console.log(`Found Part Number: ${foundPartNumber}`);
           break;
         }
@@ -185,6 +191,7 @@ export function CarPartsChat({ initialJobData, initialPartsDataList }: CarPartsC
             <DiagramViewer
               diagramData={diagramToView}
               onHotspotSelect={handleHotspotSelect}
+              onConfirmSelection={handleConfirmPartSelection}
             />
           ) : (
             <ChatContainer

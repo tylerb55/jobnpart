@@ -16,6 +16,9 @@ import { format } from "date-fns"
 import { Calendar } from "@/components/ui/calendar"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { cn } from "@/lib/utils"
+import { useRouter } from "next/navigation"
+import { toast } from "sonner"
+import type { PartsData, ChatPageData, WorkItem as ChatWorkItem, JobDetailsForChat } from "@/app/types"
 
 interface WorkItem {
   id: string
@@ -34,7 +37,21 @@ interface WorkItem {
   salesValue: number
 }
 
-export default function JobSheet() {
+// Define type for callEndpoint payload
+interface HaynesProPayload {
+  vin: string;
+  jobId: string;
+  car: string;
+  vrm: string;
+  customer: string;
+  timestamp: string;
+  workItems: ChatWorkItem[];
+}
+
+export function JobSheet() {
+  const router = useRouter()
+  const [isSubmitting, setIsSubmitting] = useState(false)
+
   const [jobDetails, setJobDetails] = useState({
     jobId: "1",
     dueDate: undefined as Date | undefined,
@@ -93,7 +110,7 @@ export default function JobSheet() {
     setWorkItems(workItems.filter((item) => item.id !== id))
   }
 
-  const updateWorkItem = (id: string, field: keyof WorkItem, value: any) => {
+  const updateWorkItem = <K extends keyof WorkItem>(id: string, field: K, value: WorkItem[K]) => {
     setWorkItems(workItems.map((item) => (item.id === id ? { ...item, [field]: value } : item)))
   }
 
@@ -103,10 +120,152 @@ export default function JobSheet() {
 
   const isVinEntered = () => {
     if (!jobDetails.vin) {
-      alert("Please enter a VIN number first")
       return false
     }
     return true
+  }
+
+  const callEndpoint = async (endpoint: string, buttonName: string) => {
+    if (!isVinEntered()) {
+      toast.error("VIN Required", {
+        description: `Please enter a VIN number first for ${buttonName}.`,
+      })
+      return
+    }
+
+    const simplifiedWorkItems: ChatWorkItem[] = workItems.map((item) => ({
+      description: item.invoiceDescription || item.workType,
+      category: "",
+    }))
+
+    try {
+      const payload: HaynesProPayload = {
+        vin: jobDetails.vin,
+        jobId: jobDetails.jobId,
+        car: jobDetails.car,
+        vrm: jobDetails.vrm,
+        customer: jobDetails.customer,
+        timestamp: new Date().toISOString(),
+        workItems: simplifiedWorkItems,
+      }
+
+      const response = await fetch(`http://localhost:8000/${endpoint}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        if (buttonName === "Haynes Pro") {
+          const newWindow = window.open("", "_blank")
+          if (newWindow) {
+            newWindow.document.write("<pre>" + JSON.stringify(data, null, 2) + "</pre>")
+            newWindow.document.close()
+          } else {
+            toast.error("Error", {
+              description: "Could not open pop-up window. Please check your pop-up blocker settings.",
+            })
+          }
+        } else {
+          toast(`${buttonName} Response`,{
+            description: JSON.stringify(data, null, 2),
+          })
+        }
+      } else {
+        toast.error(`${buttonName} Request Failed`, {
+          description: `${response.status} ${response.statusText}`,
+        })
+      }
+    } catch (error) {
+      console.error(`Error calling ${endpoint}:`, error)
+      toast.error(`Error Connecting to ${buttonName}`,{
+        description: error instanceof Error ? error.message : "Unknown error",
+      })
+    }
+  }
+
+  const handlePartsCatalogueSubmit = async () => {
+    if (!isVinEntered()) {
+      toast.error("VIN Required", {
+        description: "Please enter a VIN number first to proceed to Parts Catalogue.",
+      })
+      return
+    }
+    setIsSubmitting(true)
+
+    const simplifiedWorkItems: ChatWorkItem[] = workItems.map((item) => ({
+      description: item.invoiceDescription || item.workType,
+      category: "",
+    }))
+
+    const analysisSubmissionData: JobDetailsForChat = {
+      jobNumber: jobDetails.jobId,
+      vin: jobDetails.vin,
+      make: jobDetails.car,
+      model: "",
+      year: "",
+      engine: "",
+      workItems: simplifiedWorkItems,
+    }
+
+    try {
+      const response = await fetch("http://localhost:8000/analyse-job", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(analysisSubmissionData),
+      })
+
+      if (!response.ok) {
+        let errorBody = "Could not retrieve error details."
+        try {
+          errorBody = await response.text()
+        } catch { // Removed '_'
+          // ignore
+        }
+        console.error("Analysis API Error:", response.status, errorBody)
+        throw new Error(`Failed to analyze job details (Status: ${response.status}). ${errorBody.substring(0, 100)}`)
+      }
+
+      const partsDataList: PartsData[] = await response.json()
+
+      const jobDetailsForChatPage: JobDetailsForChat = {
+        jobNumber: jobDetails.jobId,
+        vin: jobDetails.vin,
+        make: jobDetails.car,
+        model: "",
+        year: "",
+        engine: "",
+        workItems: simplifiedWorkItems,
+      }
+
+      const chatPageData: ChatPageData = {
+        jobDetails: jobDetailsForChatPage,
+        partsDataList: partsDataList,
+      }
+
+      try {
+        sessionStorage.setItem("chatPageData", JSON.stringify(chatPageData))
+      } catch (storageError) {
+        console.error("Failed to save chatPageData to sessionStorage:", storageError)
+        toast.error("Storage Error", {
+          description: "Could not save job data locally. Please try again.",
+        })
+        setIsSubmitting(false)
+        return
+      }
+
+      router.push(`/chat`)
+    } catch (error) {
+      console.error("Parts Catalogue submission error:", error)
+      toast.error("Submission Error", {
+        description: error instanceof Error ? error.message : "An unexpected error occurred.",
+      })
+    } finally {
+      setIsSubmitting(false)
+    }
   }
 
   return (
@@ -349,21 +508,30 @@ export default function JobSheet() {
 
                 <div className="space-y-4">
                   <Button
-                    onClick={() => isVinEntered() && alert("Opening Parts Catalogue...")}
+                    onClick={handlePartsCatalogueSubmit}
                     className="w-full h-12 bg-yellow-400 hover:bg-yellow-500 text-black font-semibold flex justify-center items-center"
+                    disabled={isSubmitting}
                   >
-                    Parts Catalogue
+                    {isSubmitting ? "Analyzing..." : "Parts Catalogue"}
                   </Button>
 
                   <Button
-                    onClick={() => isVinEntered() && alert("Opening Order Bridge...")}
+                    onClick={() => callEndpoint("haynes-pro", "Haynes Pro")}
                     className="w-full h-12 bg-yellow-400 hover:bg-yellow-500 text-black font-semibold flex justify-center items-center"
                   >
-                    Order Bridge
+                    Haynes Pro
                   </Button>
 
                   <Button
-                    onClick={() => isVinEntered() && alert("Opening partslink24...")}
+                    onClick={() => {
+                      if (!isVinEntered()) {
+                        toast.error("VIN Required", {
+                          description: "Please enter a VIN number first to open partslink24.",
+                        })
+                        return
+                      }
+                      window.open("https://www.partslink24.com/partslink24/user/login.do", "_blank")
+                    }}
                     className="w-full h-12 bg-yellow-400 hover:bg-yellow-500 text-black font-semibold flex justify-center items-center"
                   >
                     partslink24
