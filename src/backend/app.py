@@ -205,14 +205,15 @@ def haynes_pro(job_data: HaynesProJobData):
                     matched_work_items.append({nodeId: work_item})
         
         for work_item in matched_work_items:
+            print(work_item)
             nodeId = list(work_item.keys())[0]
             response = requests.get(f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeInfosV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}")
             repairtime_infos = response.json()
             print(repairtime_infos)
             results_list.append(repairtime_infos)
     except Exception as e:
-        logger.info(e)
-        logger.info(traceback.format_exc())
+        print(e)
+        print(traceback.format_exc())
         return {"title":"error"}
     return results_list
     
