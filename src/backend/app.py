@@ -9,18 +9,33 @@ from schemas import *
 from dotenv import load_dotenv
 import sentence_transformers
 import numpy as np
+from contextlib import asynccontextmanager
+import logging
+import traceback
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 API_KEY = os.getenv("PARTS_CATALOG_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 HAYNES_PRO_USERNAME = os.getenv("HAYNES_PRO_USERNAME")
 HAYNES_PRO_PASSWORD = os.getenv("HAYNES_PRO_PASSWORD")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("Starting up...")
+    global model
+    model = sentence_transformers.SentenceTransformer('all-MiniLM-L6-v2')
+    yield
+    print("Shutting down...")
+    model = None
+
 app = FastAPI(
     title="JobNPart Backend API",
     description="API for searching parts and managing job interactions.",
     version="0.1.0",
+    lifespan=lifespan
 )
 
 origins = [
@@ -129,72 +144,76 @@ def analyse_job(job_data: JobData) -> List[Parts]:
       
 @app.post("/haynes-pro")
 def haynes_pro(job_data: HaynesProJobData):
-    results_list = []
-    response = requests.get(f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getAuthenticationVrid?distributorUsername={HAYNES_PRO_USERNAME}&distributorPassword={HAYNES_PRO_PASSWORD}&username=jnpda2025")
-    if response.json()["statusCode"] == 0:
-        vrid = response.json()["vrid"]
-    else:
-        print(response.text)
-        exit()
+    try:
+        results_list = []
+        response = requests.get(f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getAuthenticationVrid?distributorUsername={HAYNES_PRO_USERNAME}&distributorPassword={HAYNES_PRO_PASSWORD}&username=jnpda2025")
+        if response.json()["statusCode"] == 0:
+            vrid = response.json()["vrid"]
+        else:
+            print(response.text)
+            exit()
 
-    # 2. Decode VIN
-    vin_decode_response = requests.get(
-        f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/decodeVINV4?vrid={vrid}&vin={job_data.vin}&descriptionLanguage=en"
-    )
-    if vin_decode_response.status_code != 200:
-        print(f"Haynes Pro VIN decoding failed: {vin_decode_response.text}")
-        return {"error": "Haynes Pro VIN decoding failed", "details": vin_decode_response.text}
-    
-    vehicle_info_list = vin_decode_response.json()
-    if not vehicle_info_list or not isinstance(vehicle_info_list, list) or not vehicle_info_list[0].get("id"):
-        print(f"Invalid vehicle info from VIN decode: {vehicle_info_list}")
-        return {"error": "Invalid vehicle info from Haynes Pro", "details": vehicle_info_list}
-    car_type_id = vehicle_info_list[0]["id"]
+        # 2. Decode VIN
+        vin_decode_response = requests.get(
+            f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/decodeVINV4?vrid={vrid}&vin={job_data.vin}&descriptionLanguage=en"
+        )
+        if vin_decode_response.status_code != 200:
+            print(f"Haynes Pro VIN decoding failed: {vin_decode_response.text}")
+            return {"error": "Haynes Pro VIN decoding failed", "details": vin_decode_response.text}
+        
+        vehicle_info_list = vin_decode_response.json()
+        if not vehicle_info_list or not isinstance(vehicle_info_list, list) or not vehicle_info_list[0].get("id"):
+            print(f"Invalid vehicle info from VIN decode: {vehicle_info_list}")
+            return {"error": "Invalid vehicle info from Haynes Pro", "details": vehicle_info_list}
+        car_type_id = vehicle_info_list[0]["id"]
 
-    # 3. Get Repair Time Types (e.g., Standard Times)
-    rt_types_response = requests.get(
-        f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeTypesV2?vrid={vrid}&carTypeId={car_type_id}&descriptionLanguage=en"
-    )
-    if rt_types_response.status_code != 200:
-        print(f"Failed to get repair time types: {rt_types_response.text}")
-        return {"error": "Failed to get repair time types", "details": rt_types_response.text}
+        # 3. Get Repair Time Types (e.g., Standard Times)
+        rt_types_response = requests.get(
+            f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeTypesV2?vrid={vrid}&carTypeId={car_type_id}&descriptionLanguage=en"
+        )
+        if rt_types_response.status_code != 200:
+            print(f"Failed to get repair time types: {rt_types_response.text}")
+            return {"error": "Failed to get repair time types", "details": rt_types_response.text}
 
-    repairtime_types = rt_types_response.json()
-    if not repairtime_types or not isinstance(repairtime_types, list):
-        print(f"No repair time types found: {repairtime_types}")
-        return {"error": "No repair time types found", "details": repairtime_types}
-    
-    """For now we only use the first repair time type but going forward we should add a search for the best match"""
-    target_repairtime_type = repairtime_types[0]
-    target_repairtime_type_id = target_repairtime_type['repairtimeTypeId']
-    type_category = target_repairtime_type.get('typeCategory', 'CAR')
-    
-    matched_work_items = []
-    for work_item in job_data.workItems:
-        nodeId = "root"
-        has_subnodes = True
-        while has_subnodes:
-            main_groups_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeSubnodesByGroupV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}"
-            main_groups_resp = requests.get(main_groups_url)
-            # find the best match for the work item in the main groups
-            best_match_group = find_best_match(work_item.title, main_groups_resp.json(), text_key="title")
-            if best_match_group:
-                nodeId = best_match_group[0]
-                has_subnodes = best_match_group[2].get("hasSubnodes", False)
-            else:
-                has_subnodes = False
-                
-            #print(best_match_group)
-            if has_subnodes!=True:
-                matched_work_items.append({nodeId: work_item})
-    
-    for work_item in matched_work_items:
-        nodeId = list(work_item.keys())[0]
-        response = requests.get(f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeInfosV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}")
-        repairtime_infos = response.json()
-        print(repairtime_infos)
-        results_list.append(repairtime_infos)
-
+        repairtime_types = rt_types_response.json()
+        if not repairtime_types or not isinstance(repairtime_types, list):
+            print(f"No repair time types found: {repairtime_types}")
+            return {"error": "No repair time types found", "details": repairtime_types}
+        
+        """For now we only use the first repair time type but going forward we should add a search for the best match"""
+        target_repairtime_type = repairtime_types[0]
+        target_repairtime_type_id = target_repairtime_type['repairtimeTypeId']
+        type_category = target_repairtime_type.get('typeCategory', 'CAR')
+        
+        matched_work_items = []
+        for work_item in job_data.workItems:
+            nodeId = "root"
+            has_subnodes = True
+            while has_subnodes:
+                main_groups_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeSubnodesByGroupV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}"
+                main_groups_resp = requests.get(main_groups_url)
+                # find the best match for the work item in the main groups
+                best_match_group = find_best_match(work_item.title, main_groups_resp.json(), text_key="title")
+                if best_match_group:
+                    nodeId = best_match_group[0]
+                    has_subnodes = best_match_group[2].get("hasSubnodes", False)
+                else:
+                    has_subnodes = False
+                    
+                #print(best_match_group)
+                if has_subnodes!=True:
+                    matched_work_items.append({nodeId: work_item})
+        
+        for work_item in matched_work_items:
+            nodeId = list(work_item.keys())[0]
+            response = requests.get(f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeInfosV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}")
+            repairtime_infos = response.json()
+            print(repairtime_infos)
+            results_list.append(repairtime_infos)
+    except Exception as e:
+        logger.info(e)
+        logger.info(traceback.format_exec())
+        return {"title":"error"}
     return results_list
     
 
