@@ -200,7 +200,7 @@ def haynes_pro(job_data: HaynesProJobData):
                 else:
                     has_subnodes = False
                     
-                #print(best_match_group)
+                print(best_match_group)
                 if has_subnodes!=True:
                     matched_work_items.append({nodeId: work_item})
         
