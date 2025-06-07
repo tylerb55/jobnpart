@@ -3,8 +3,8 @@ from typing import List, Optional, Dict, Any, Literal
 
     
 class WorkItem(BaseModel):
-    description: str
-    category: str
+    title: str
+    invoice_description: str
 
 class JobData(BaseModel):
     jobNumber: str
@@ -18,6 +18,7 @@ class JobData(BaseModel):
 class HaynesProJobData(BaseModel):
     vin: str
     workItems: List[WorkItem]
+    
 
 class Part(BaseModel):
     id: Optional[str] = None

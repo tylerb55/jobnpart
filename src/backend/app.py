@@ -177,7 +177,7 @@ def haynes_pro(job_data: HaynesProJobData):
             main_groups_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeSubnodesByGroupV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}"
             main_groups_resp = requests.get(main_groups_url)
             # find the best match for the work item in the main groups
-            best_match_group = find_best_match(work_item.description, main_groups_resp.json(), text_key="description")
+            best_match_group = find_best_match(work_item.title, main_groups_resp.json(), text_key="title")
             if best_match_group:
                 nodeId = best_match_group[0]
                 has_subnodes = best_match_group[2].get("hasSubnodes", False)
@@ -197,139 +197,11 @@ def haynes_pro(job_data: HaynesProJobData):
 
     return results_list
     
-    
-    
-    
-@app.post("/hp-job-info")
-def hp_job_info(job_data: JobData) -> List[dict]:
-    """
-    Retrieves Haynes Pro repair information based on VIN and job work items.
-    """
-    results_list = []
-
-    # 1. Haynes Pro Authentication
-    auth_response = requests.get(
-        f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getAuthenticationVrid?distributorUsername={HAYNES_PRO_USERNAME}&distributorPassword={HAYNES_PRO_PASSWORD}&username=jnpda2025"
-    )
-    if auth_response.status_code != 200 or auth_response.json().get("statusCode") != 0:
-        print(f"Haynes Pro authentication failed: {auth_response.text}")
-        # Consider raising HTTPException here
-        return {"error": "Haynes Pro authentication failed", "details": auth_response.text}
-    vrid = auth_response.json()["vrid"]
-
-    # 2. Decode VIN
-    vin_decode_response = requests.get(
-        f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/decodeVINV4?vrid={vrid}&vin={job_data.vin}&descriptionLanguage=en"
-    )
-    if vin_decode_response.status_code != 200:
-        print(f"Haynes Pro VIN decoding failed: {vin_decode_response.text}")
-        return {"error": "Haynes Pro VIN decoding failed", "details": vin_decode_response.text}
-    
-    vehicle_info_list = vin_decode_response.json()
-    if not vehicle_info_list or not isinstance(vehicle_info_list, list) or not vehicle_info_list[0].get("id"):
-        print(f"Invalid vehicle info from VIN decode: {vehicle_info_list}")
-        return {"error": "Invalid vehicle info from Haynes Pro", "details": vehicle_info_list}
-    car_type_id = vehicle_info_list[0]["id"]
-
-    # 3. Get Repair Time Types (e.g., Standard Times)
-    rt_types_response = requests.get(
-        f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeTypesV2?vrid={vrid}&carTypeId={car_type_id}&descriptionLanguage=en"
-    )
-    if rt_types_response.status_code != 200:
-        print(f"Failed to get repair time types: {rt_types_response.text}")
-        return {"error": "Failed to get repair time types", "details": rt_types_response.text}
-
-    repairtime_types = rt_types_response.json()
-    if not repairtime_types or not isinstance(repairtime_types, list):
-        print(f"No repair time types found: {repairtime_types}")
-        return {"error": "No repair time types found", "details": repairtime_types}
-    
-    # Assuming we use the first repairtimeType, e.g., "Standard Times"
-    # You might want to search for a specific description like "Standard Times"
-    target_repairtime_type = repairtime_types[0]
-    target_repairtime_type_id = target_repairtime_type['repairtimeTypeId']
-    type_category = target_repairtime_type.get('typeCategory', 'CAR')
-
-
-    for work_item in job_data.workItems:
-        work_item_result = {
-            "workItemDescription": work_item.description,
-            "identifiedGroup": None,
-            "finalNodeId": None,
-            "repairTimeInfos": [],
-            "errors": []
-        }
-
-        # 4a. Get Main Groups from Haynes Pro to identify the carTypeGroup
-        main_groups_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeSubnodesByGroupV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId=root"
-        main_groups_resp = requests.get(main_groups_url)
-        
-        search_car_type_group = None
-        if main_groups_resp.status_code == 200:
-            main_groups_list = main_groups_resp.json()
-            if main_groups_list and isinstance(main_groups_list, list):
-                best_main_group_match = find_best_match(work_item.description, main_groups_list, text_key="description")
-                if best_main_group_match:
-                    search_car_type_group = best_main_group_match[2]['description'] # The description of the matched group
-                    work_item_result["identifiedGroup"] = search_car_type_group
-            else:
-                work_item_result["errors"].append(f"Could not parse main groups: {main_groups_list}")
-        else:
-            work_item_result["errors"].append(f"Error fetching main groups: {main_groups_resp.text}")
-
-        if not search_car_type_group:
-            work_item_result["errors"].append(f"Could not determine a carTypeGroup for '{work_item.description}'. Skipping Haynes Pro search for this item.")
-            results_list.append(work_item_result)
-            continue
-            
-        # 4b. Iteratively find the deepest relevant node within the identified carTypeGroup
-        current_hp_node_id = "root" # Start at the root for the given carTypeGroup
-        hp_has_subnodes = True
-        final_node_id_for_infos = current_hp_node_id # Default to root of group if no subnodes found
-
-        while hp_has_subnodes:
-            subnodes_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeSubnodesByGroupV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={current_hp_node_id}&carTypeGroup={search_car_type_group}"
-            subnodes_resp = requests.get(subnodes_url)
-            
-            if subnodes_resp.status_code == 200:
-                repairtime_subnodes = subnodes_resp.json()
-                if repairtime_subnodes and isinstance(repairtime_subnodes, list) and len(repairtime_subnodes) > 0:
-                    # Logic from haynes_pro.py: take the first subnode.
-                    # For a more advanced system, you might use find_best_match here too.
-                    selected_node_data = repairtime_subnodes[0]
-                    hp_has_subnodes = selected_node_data.get("hasSubnodes", False)
-                    current_hp_node_id = selected_node_data.get("id")
-                    final_node_id_for_infos = current_hp_node_id # Update the node to use for fetching infos
-                    
-                    if not current_hp_node_id: # Safety break if id is missing
-                        hp_has_subnodes = False
-                    if not hp_has_subnodes: # If this node has no more subnodes, we use this one
-                        break
-                else: # No subnodes found or empty list
-                    hp_has_subnodes = False
-            else:
-                work_item_result["errors"].append(f"Error fetching subnodes for group {search_car_type_group}, node {current_hp_node_id}: {subnodes_resp.text}")
-                hp_has_subnodes = False
-        
-        work_item_result["finalNodeId"] = final_node_id_for_infos
-
-        # 5. Get Repair Time Infos for the final node
-        infos_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeInfosV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={final_node_id_for_infos}"
-        infos_resp = requests.get(infos_url)
-
-        if infos_resp.status_code == 200:
-            repair_infos_data = infos_resp.json()
-            work_item_result["repairTimeInfos"] = repair_infos_data
-        else:
-            work_item_result["errors"].append(f"Error fetching repair time infos for node {final_node_id_for_infos}: {infos_resp.text}")
-        
-        results_list.append(work_item_result)
-
-    return results_list
 
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the JobNPart Backend API"}
+
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
