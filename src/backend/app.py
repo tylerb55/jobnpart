@@ -212,7 +212,7 @@ def haynes_pro(job_data: HaynesProJobData):
             results_list.append(repairtime_infos)
     except Exception as e:
         logger.info(e)
-        logger.info(traceback.format_exec())
+        logger.info(traceback.format_exc())
         return {"title":"error"}
     return results_list
     
