@@ -200,16 +200,16 @@ def haynes_pro(job_data: HaynesProJobData):
                 else:
                     has_subnodes = False
                     
-                print(best_match_group)
+                print(f"best match group: {best_match_group}")
                 if has_subnodes!=True:
                     matched_work_items.append({nodeId: work_item})
         
         for work_item in matched_work_items:
-            print(work_item)
+            print(f"work item: {work_item}")
             nodeId = list(work_item.keys())[0]
             response = requests.get(f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeInfosV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}")
             repairtime_infos = response.json()
-            print(repairtime_infos)
+            print(f"repairtime infos: {repairtime_infos}")
             results_list.append(repairtime_infos)
     except Exception as e:
         print(e)
