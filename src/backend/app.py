@@ -23,10 +23,10 @@ HAYNES_PRO_USERNAME = os.getenv("HAYNES_PRO_USERNAME")
 HAYNES_PRO_PASSWORD = os.getenv("HAYNES_PRO_PASSWORD")
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_: FastAPI):
     print("Starting up...")
     global model
-    model = sentence_transformers.SentenceTransformer('all-MiniLM-L6-v2')
+    model = sentence_transformers.SentenceTransformer('intfloat/e5-base-v2')
     yield
     print("Shutting down...")
     model = None
@@ -65,7 +65,7 @@ def find_best_match(job_description: str, items_list: List[dict], text_key: str 
     Returns:
         A tuple (item_id, item_text, item_object) for the best match, or None if no match is found.
     """
-    model = sentence_transformers.SentenceTransformer('all-MiniLM-L6-v2')
+    #model = sentence_transformers.SentenceTransformer('intfloat/e5-base-v2')
     job_description_embedding = model.encode(job_description)
     best_match_similarity = -1.0  # Cosine similarity ranges from -1 to 1
     best_match_details = None
@@ -91,6 +91,33 @@ def find_best_match(job_description: str, items_list: List[dict], text_key: str 
             best_match_details = (item.get("id"), item_text, item)
             
     return best_match_details
+
+def chose_category(job_title: str, model_type: str) -> str:
+    categories = ["ENGINE","TRANSMISSION","STEERING","BRAKES","EXTERIOR","ELECTRONICS","QUICKGUIDES"]
+    if model_type == "gemini":
+        gen_model = genai.Client(api_key=GEMINI_API_KEY)
+        prompt = f"Given the following job description: {job_title}, choose the most appropriate category from the following list: {categories}. Only return the category, no other text."
+        response = gen_model.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
+        )
+        return response.text
+    elif model_type == "sentence_transformer":
+        #model = sentence_transformers.SentenceTransformer('all-MiniLM-L6-v2')
+        job_description_embedding = model.encode(job_title)
+        best_match_similarity = -1.0
+        best_match_details = None
+        for category in categories:
+            category_embedding = model.encode(category)
+            cosine_similarity = np.dot(job_description_embedding, category_embedding) / \
+                                (np.linalg.norm(job_description_embedding) * np.linalg.norm(category_embedding))
+            if cosine_similarity > best_match_similarity:
+                best_match_similarity = cosine_similarity
+                best_match_details = category
+        return best_match_details
+    else:
+        print("Invalid model: Select gemini or sentence_transformer")
+        return None
 
 # --- API Endpoints ---
 
@@ -141,7 +168,8 @@ def analyse_job(job_data: JobData) -> List[Parts]:
         parts_list.append(parts)
     print(parts_list)
     return parts_list
-      
+
+
 @app.post("/haynes-pro")
 def haynes_pro(job_data: HaynesProJobData):
     try:
@@ -185,15 +213,20 @@ def haynes_pro(job_data: HaynesProJobData):
         target_repairtime_type_id = target_repairtime_type['repairtimeTypeId']
         type_category = target_repairtime_type.get('typeCategory', 'CAR')
         
+        car_type_group = chose_category(job_data.workItems[0].title, "sentence_transformer")
+        print(f"job title: {job_data.workItems[0].title}")
+        print(f"car type group: {car_type_group}")
+        
         matched_work_items = []
         for work_item in job_data.workItems:
             nodeId = "root"
             has_subnodes = True
             while has_subnodes:
-                main_groups_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeSubnodesByGroupV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}"
-                main_groups_resp = requests.get(main_groups_url)
+                main_groups_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeSubnodesByGroupV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}&carTypeGroup={car_type_group}"
+                main_groups_resp = requests.get(main_groups_url).json()
+                main_groups = [group for group in main_groups_resp if group.get("hasSubnodes", False) is True or group.get("hasInfoGroups", False) is True]
                 # find the best match for the work item in the main groups
-                best_match_group = find_best_match(work_item.title, main_groups_resp.json(), text_key="title")
+                best_match_group = find_best_match(work_item.title, main_groups, text_key="description")
                 if best_match_group:
                     nodeId = best_match_group[0]
                     has_subnodes = best_match_group[2].get("hasSubnodes", False)
@@ -201,16 +234,17 @@ def haynes_pro(job_data: HaynesProJobData):
                     has_subnodes = False
                     
                 print(f"best match group: {best_match_group}")
-                if has_subnodes!=True:
-                    matched_work_items.append({nodeId: work_item})
+                if has_subnodes==False:
+                    print(main_groups)
+                    matched_work_items.append({"nodeId": nodeId, "description": best_match_group[2].get("description"), "work_item": work_item, "main_groups": main_groups})
         
         for work_item in matched_work_items:
-            print(f"work item: {work_item}")
-            nodeId = list(work_item.keys())[0]
+            #print(f"work item: {work_item}")
+            nodeId = work_item.get("nodeId")
             response = requests.get(f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeInfosV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}")
             repairtime_infos = response.json()
             print(f"repairtime infos: {repairtime_infos}")
-            results_list.append(repairtime_infos)
+            results_list.append({"nodeId": nodeId, "description": work_item.get("description"), "repairtime_infos": repairtime_infos, "main_groups": work_item.get("main_groups")})
     except Exception as e:
         print(e)
         print(traceback.format_exc())
