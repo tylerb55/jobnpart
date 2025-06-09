@@ -254,59 +254,6 @@ def haynes_pro(job_data: HaynesProJobData):
     return results_list
     
 
-@app.post("/calculate-repairtime")
-def calculate_repairtime(job_data: CalculateRepairtimeJobData):
-    try:
-        response = requests.get(f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getAuthenticationVrid?distributorUsername={HAYNES_PRO_USERNAME}&distributorPassword={HAYNES_PRO_PASSWORD}&username=jnpda2025")
-        if response.json()["statusCode"] == 0:
-            vrid = response.json()["vrid"]
-        else:
-            print(response.text)
-            exit()
-            
-        # The number of VAT rates must match the number of repairTaskIds
-        vat_rates = [2000] * len(job_data.repairTaskIds)
-        
-        base_url = "https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/processRepairTasksV4"
-
-        # Parameters for the GET request. `requests` will handle URL encoding.
-        payload = {
-            'vrid': vrid,
-            'descriptionLanguage': 'en',
-            'carTypeId': job_data.car_type_id,
-            'repairtimeTypeId': job_data.target_repairtime_type_id,
-            'typeCategory': job_data.type_category,
-            'repairTaskIds': job_data.repairTaskIds,
-            'repairVatRates': vat_rates,
-            'useMaintenanceTasks': 'false',
-            'labourRateMechanical': 10000,
-            'labourRateElectronics': 10000,
-            'labourRateBody': 10000
-        }
-        
-        # Make the GET request using the `params` argument
-        response = requests.get(base_url, params=payload)
-        
-        # For debugging: print the exact URL that was requested
-        print(f"Requesting URL: {response.url}")
-        
-        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
-
-        print(f"response: {response.json()}")
-        response_data = response.json()
-        results = {"BasketItems": response_data.get("basketItems", []), "TotalRepairTime": response_data.get("totalRepairTime")}
-
-    except requests.exceptions.HTTPError as http_err:
-        print(f"HTTP error occurred: {http_err}")
-        print(f"Response body: {response.text}")
-        traceback.print_exc()
-        return {"title": "error", "detail": "HTTP error from HaynesPro API"}
-    except Exception as e:
-        print(e)
-        print(traceback.format_exc())
-        return {"title":"error", "detail": str(e)}
-    return results
-
 @app.post("/repair-instructions")
 def repair_instructions(job_data: RepairInstructionsJobData):
     try:

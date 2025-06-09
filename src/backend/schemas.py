@@ -48,3 +48,14 @@ class Parts(BaseModel):
     partGroups: List[PartGroup]
     positions: Optional[List[Position]] = None
 
+class CalculateRepairtimeJobData(BaseModel):
+    target_repairtime_type_id: str
+    type_category: str
+    repairTaskIds: List[str]
+    car_type_id: str
+    
+class RepairInstructionsJobData(BaseModel):
+    target_repairtime_type_id: str
+    type_category: str
+    repairTaskIds: List[str]
+    
