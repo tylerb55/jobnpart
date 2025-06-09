@@ -194,6 +194,7 @@ def haynes_pro(job_data: HaynesProJobData):
             print(f"Invalid vehicle info from VIN decode: {vehicle_info_list}")
             return {"error": "Invalid vehicle info from Haynes Pro", "details": vehicle_info_list}
         car_type_id = vehicle_info_list[0]["id"]
+        print(f"car type id: {car_type_id}")
 
         # 3. Get Repair Time Types (e.g., Standard Times)
         rt_types_response = requests.get(
@@ -211,6 +212,7 @@ def haynes_pro(job_data: HaynesProJobData):
         """For now we only use the first repair time type but going forward we should add a search for the best match"""
         target_repairtime_type = repairtime_types[0]
         target_repairtime_type_id = target_repairtime_type['repairtimeTypeId']
+        print(f"target repair time type id: {target_repairtime_type_id}")
         type_category = target_repairtime_type.get('typeCategory', 'CAR')
         
         car_type_group = chose_category(job_data.workItems[0].title, "sentence_transformer")
@@ -236,7 +238,7 @@ def haynes_pro(job_data: HaynesProJobData):
                 print(f"best match group: {best_match_group}")
                 if has_subnodes==False:
                     print(main_groups)
-                    matched_work_items.append({"nodeId": nodeId, "description": best_match_group[2].get("description"), "work_item": work_item, "main_groups": main_groups})
+                    matched_work_items.append({"nodeId": nodeId, "description": best_match_group[2].get("description"), "work_item": work_item, "main_groups": main_groups, "value": best_match_group[2].get("value")})
         
         for work_item in matched_work_items:
             #print(f"work item: {work_item}")
@@ -244,13 +246,88 @@ def haynes_pro(job_data: HaynesProJobData):
             response = requests.get(f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeInfosV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}")
             repairtime_infos = response.json()
             print(f"repairtime infos: {repairtime_infos}")
-            results_list.append({"nodeId": nodeId, "description": work_item.get("description"), "repairtime_infos": repairtime_infos, "main_groups": work_item.get("main_groups")})
+            results_list.append({"car_type_id": car_type_id, "nodeId": nodeId, "description": work_item.get("description"), "repairtime_infos": repairtime_infos, "main_groups": work_item.get("main_groups"), "value": work_item.get("value")})
     except Exception as e:
         print(e)
         print(traceback.format_exc())
         return {"title":"error"}
     return results_list
     
+
+@app.post("/calculate-repairtime")
+def calculate_repairtime(job_data: CalculateRepairtimeJobData):
+    try:
+        response = requests.get(f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getAuthenticationVrid?distributorUsername={HAYNES_PRO_USERNAME}&distributorPassword={HAYNES_PRO_PASSWORD}&username=jnpda2025")
+        if response.json()["statusCode"] == 0:
+            vrid = response.json()["vrid"]
+        else:
+            print(response.text)
+            exit()
+            
+        # The number of VAT rates must match the number of repairTaskIds
+        vat_rates = [2000] * len(job_data.repairTaskIds)
+        
+        base_url = "https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/processRepairTasksV4"
+
+        # Parameters for the GET request. `requests` will handle URL encoding.
+        payload = {
+            'vrid': vrid,
+            'descriptionLanguage': 'en',
+            'carTypeId': job_data.car_type_id,
+            'repairtimeTypeId': job_data.target_repairtime_type_id,
+            'typeCategory': job_data.type_category,
+            'repairTaskIds': job_data.repairTaskIds,
+            'repairVatRates': vat_rates,
+            'useMaintenanceTasks': 'false',
+            'labourRateMechanical': 10000,
+            'labourRateElectronics': 10000,
+            'labourRateBody': 10000
+        }
+        
+        # Make the GET request using the `params` argument
+        response = requests.get(base_url, params=payload)
+        
+        # For debugging: print the exact URL that was requested
+        print(f"Requesting URL: {response.url}")
+        
+        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+
+        print(f"response: {response.json()}")
+        response_data = response.json()
+        results = {"BasketItems": response_data.get("basketItems", []), "TotalRepairTime": response_data.get("totalRepairTime")}
+
+    except requests.exceptions.HTTPError as http_err:
+        print(f"HTTP error occurred: {http_err}")
+        print(f"Response body: {response.text}")
+        traceback.print_exc()
+        return {"title": "error", "detail": "HTTP error from HaynesPro API"}
+    except Exception as e:
+        print(e)
+        print(traceback.format_exc())
+        return {"title":"error", "detail": str(e)}
+    return results
+
+@app.post("/repair-instructions")
+def repair_instructions(job_data: RepairInstructionsJobData):
+    try:
+        response = requests.get(f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getAuthenticationVrid?distributorUsername={HAYNES_PRO_USERNAME}&distributorPassword={HAYNES_PRO_PASSWORD}&username=jnpda2025")
+        if response.json()["statusCode"] == 0:
+            vrid = response.json()["vrid"]
+        else:
+            print(response.text)
+            exit()
+        
+        results_list = []
+        for repair_task_id in job_data.repairTaskIds:
+            response = requests.get(f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeInfosV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={job_data.target_repairtime_type_id}&typeCategory={job_data.type_category}&repairTaskId={repair_task_id}")
+            repairtime_infos = response.json()
+            print(f"repairtime infos: {repairtime_infos}")
+            results_list.append({"repair_task_id": repair_task_id, "repairtime_infos": repairtime_infos})
+    except Exception as e:
+        print(e)
+        print(traceback.format_exc())
+        return {"title":"error"}
+    return results_list
 
 @app.get("/")
 def read_root():
@@ -259,3 +336,6 @@ def read_root():
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+
+
+
