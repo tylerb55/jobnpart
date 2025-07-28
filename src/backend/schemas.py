@@ -5,6 +5,8 @@ from typing import List, Optional, Dict, Any, Literal
 class WorkItem(BaseModel):
     title: str
     invoice_description: str
+    parts_numbers: List[str]
+    
 
 class JobData(BaseModel):
     jobNumber: str
@@ -14,10 +16,12 @@ class JobData(BaseModel):
     vin: str
     workItems: List[WorkItem]
     year: str
+    tenant: str
     
 class HaynesProJobData(BaseModel):
     vin: str
     workItems: List[WorkItem]
+    tenant: str
     
 
 class Part(BaseModel):
@@ -58,4 +62,13 @@ class RepairInstructionsJobData(BaseModel):
     target_repairtime_type_id: str
     type_category: str
     repairTaskIds: List[str]
+    tenant: str
+    vin: str
+    
+class PartsLink24JobData(BaseModel):
+    tenant: str
+    brand: str
+    vin: str
+    workItems: List[WorkItem]
+    
     
