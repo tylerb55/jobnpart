@@ -333,8 +333,23 @@ def repair_instructions(job_data: RepairInstructionsJobData):
     return results_list
 
 
+def get_supported_brands(input_brand):
+    supported_brands = {"brands":["Alpine","Audi","Bentley","BMW","BMWMotorrad","Seat","Dacia","Jaguar","LandRover","Mercedes","MercedesTrucks","MercedesUnimog","MercedesVans","Mini","Mitsubishi","MAN","Porsche","PorscheClassic","Renault","Seat","Skoda","Smart","VW","VWCommercial","Toyota","Lexus","Suzuki"]}
+    brands_list = supported_brands.get("brands", [])
+    for brand in brands_list:
+        if input_brand.lower() == brand.lower():
+            return brand
+        elif input_brand.lower() == "vw" or input_brand.lower() == "volkswagen":
+            return "VW"
+    return None
+
 @app.post("/partslink24")
 def partslink24(job_data: PartsLink24JobData):
+    brand = get_supported_brands(job_data.brand)
+    if brand is None:
+        return {"title":"error", "message":"Brand not supported"}
+    
+    
     BASE_URL = "https://demo.partslink24.com/pl24-orderbrg/ext/"
 
     # Authentication (Basic Auth)
@@ -348,24 +363,24 @@ def partslink24(job_data: PartsLink24JobData):
         "Content-Type": "application/xml" # Explicitly set Content-Type for XML
     }
     
-    print("--- EXT order-submissions Mercedes-Benz PKW ---")
+    print(f"--- EXT order-submissions {job_data.brand}  ---")
     part_items = ""
     externalID = 1
     for part in job_data.workItems:
         # Check if part has partnumbers list and handle accordingly
-        if hasattr(part, 'partnumbers') and part.partnumbers:
+        if hasattr(part, 'part_numbers') and part.part_numbers:
             # Create a partItem for each part number
-            for part_number in part.partnumbers:
-                part_items += f"""<partItem externalID="{externalID}" activity="rep{externalID}">
-            <description>{part.invoice_description}</description>
+            for part_number in part.part_numbers:
+                part_items += f"""  <partItem externalID="{externalID}" activity="rep{externalID}">
+            <description>{part.invoice_description[:20]}</description>
             <partNumber>{part_number}</partNumber>
             <quantity>1</quantity>
-        </partItem>\n"""
+        </partItem>"""
                 externalID += 1
         else:
             # If no part numbers or empty list, use "unknown"
             part_items += f"""<partItem externalID="{externalID}" activity="rep{externalID}">
-            <description>{part.invoice_description}</description>
+            <description>{part.invoice_description[:20]}</description>
             <partNumber>unknown</partNumber>
             <quantity>1</quantity>
         </partItem>\n"""
@@ -383,7 +398,7 @@ def partslink24(job_data: PartsLink24JobData):
         <history>
         </history>
         <orderData>
-            <brand>{job_data.brand}</brand>
+            <brand>{brand}</brand>
             <vin>{job_data.vin}</vin>
             <partItems>
                 {part_items}
@@ -393,6 +408,7 @@ def partslink24(job_data: PartsLink24JobData):
             <paintItems>
             </paintItems>    </orderData>
     </orderSubmission>"""
+    print(xml_body_order_submission)
     try:
         log_api_call("partslink24", job_data.tenant, job_data.vin, order_submission_url, "POST")
         response = requests.post(order_submission_url, headers=headers, data=xml_body_order_submission, auth=AUTH)
