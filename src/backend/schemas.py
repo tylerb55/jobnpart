@@ -7,6 +7,16 @@ class WorkItem(BaseModel):
     invoice_description: str
     parts_numbers: List[str]
     
+class CreateTreeJobData(BaseModel):
+    vin: str
+    tenant: str
+  
+class NodeSearchJobData(BaseModel):
+    vrid: str
+    target_repairtime_type_id: str
+    type_category: str
+    nodeId: str
+    
 
 class JobData(BaseModel):
     jobNumber: str
@@ -22,6 +32,9 @@ class HaynesProJobData(BaseModel):
     vin: str
     workItems: List[WorkItem]
     tenant: str
+    mileage: str
+    last_service_date: str
+    
     
 
 class Part(BaseModel):
