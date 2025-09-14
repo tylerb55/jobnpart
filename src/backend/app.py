@@ -581,8 +581,8 @@ def check_maintenance_period(maintenance_tasks: dict, days_since_last_service: i
     Filter maintenance tasks based on time/mileage requirements in remarks.
     
     Rules:
-    - If requirement is fully met: includeasdefault = True, keep task
-    - If requirement is 70%+ met but not fully: includeasdefault = False, keep task
+    - If requirement is fully met: includeByDefault = True, keep task
+    - If requirement is 70%+ met but not fully: includeByDefault = False, keep task
     - Otherwise: remove task
     """
     months_since_last_service = days_since_last_service / 30.0
@@ -622,12 +622,12 @@ def check_maintenance_period(maintenance_tasks: dict, days_since_last_service: i
         # If no time/mileage requirements found in remark, keep the task with default behavior
         if not month_matches and not mile_matches:
             keep_task = True
-            include_as_default = task.get("includeasdefault", False)
+            include_as_default = task.get("includeByDefault", False)
         
         if keep_task:
-            # Update the task with the calculated includeasdefault value
+            # Update the task with the calculated includeByDefault value
             task_copy = task.copy()
-            task_copy["includeasdefault"] = include_as_default
+            task_copy["includeByDefault"] = include_as_default
             filtered_tasks.append(task_copy)
     
     # Return the filtered maintenance tasks structure
