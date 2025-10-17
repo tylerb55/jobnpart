@@ -4,10 +4,13 @@ from typing import List, Optional
 import uvicorn
 from google import genai
 import requests
+from requests.auth import HTTPBasicAuth
 import os
 from schemas import *
 from dotenv import load_dotenv
-import sentence_transformers
+from annoy import AnnoyIndex
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from rank_bm25 import BM25Okapi
 import numpy as np
 from contextlib import asynccontextmanager
 import logging
@@ -16,6 +19,11 @@ from supabase import create_client, Client
 from datetime import datetime
 import json
 import re
+import asyncio
+from threading import Timer
+import aiohttp
+import pickle
+import tempfile
 
 load_dotenv()
 
@@ -27,15 +35,244 @@ HAYNES_PRO_USERNAME = os.getenv("HAYNES_PRO_USERNAME")
 HAYNES_PRO_PASSWORD = os.getenv("HAYNES_PRO_PASSWORD")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+QUOTE_API_USERNAME = os.getenv("QUOTE_API_USERNAME")
+QUOTE_API_PASSWORD = os.getenv("QUOTE_API_PASSWORD")
+PARTS_SEARCH_AVAILABLE = os.getenv("PARTS_SEARCH_AVAILABLE")
+VECTOR_DIMENSION = 768
+METRIC = 'angular' # Common metric for semantic similarity (cosine similarity)
+NUM_TREES = 10     # Higher number of trees gives better precision but slower indexing
 
-# Initialize Supabase client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Initialize Supabase client with service role key (bypasses RLS for backend operations)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
+
+# Global variable to store the bearer token
+bearer_token: Optional[str] = None
+global REPAIR_TASKS
+global REPAIR_DESCRIPTIONS
+global bm25
+global annoy_index
+global full_repair_tree
+
+def pickle_object(obj, filename):
+    """Serializes a Python object to a file."""
+    with open(filename, 'wb') as f:
+        pickle.dump(obj, f)
+    print(f"\nSuccessfully pickled object to '{filename}'.")
+
+def unpickle_object(filename):
+    """Deserializes a Python object from a file."""
+    with open(filename, 'rb') as f:
+        obj = pickle.load(f)
+    print(f"Successfully unpickled object from '{filename}'.")
+    return obj
+
+def upload_to_supabase(file_path):
+    if file_path.endswith(".json"):
+        mime_type = "application/json"
+    elif file_path.endswith(".pkl"):
+        mime_type = "application/octet-stream"
+    elif file_path.endswith(".ann"):
+        mime_type = "text/plain"
+    else:
+        print(f"Unsupported file type: {file_path}")
+        return None
+    try:
+        with open(file_path, "rb") as f:
+            response = supabase.storage.from_("repair_tasks").upload(
+                file=f,
+                path=file_path.split(".")[-1] + "/" + file_path,
+                # Set a file_options for pickle files. The MIME type is usually 'application/octet-stream' for generic binary files.
+                file_options={"content-type": mime_type, "cache-control": "3600", "upsert": "true",}
+            )
+        print(f"{file_path} uploaded successfully!")
+    except Exception as e:
+        print(f"Error uploading file: {e}")
+        return None
+    
+def download_from_supabase(vrm: str):
+    global REPAIR_TASKS, REPAIR_DESCRIPTIONS, annoy_index, bm25, full_repair_tree
+    try:
+        # Attempt to download the file bytes
+        json_repair_tree = supabase.storage.from_("repair_tasks").download(f"json/{vrm}_repair_tree.json")
+        with open(f"{vrm}_repair_tree.json", "rb") as f:
+            full_repair_tree = json.load(f)
+        os.remove(f"{vrm}_repair_tree.json")
+        json_repair_tasks = supabase.storage.from_("repair_tasks").download(f"json/{vrm}_repair_tasks.json")
+        with open(f"{vrm}_repair_tasks.json", "rb") as f:
+            json_repair_tasks = json.load(f)
+        os.remove(f"{vrm}_repair_tasks.json")
+        REPAIR_TASKS = json_repair_tasks["tasks"]
+        REPAIR_DESCRIPTIONS = json_repair_tasks["descriptions"]
+        print(f"Json repair tasks: {json_repair_tasks}")
+        annoy_index_bytes = supabase.storage.from_("repair_tasks").download(f"ann/{vrm}_annoy_index.ann")
+        annoy_index = AnnoyIndex(VECTOR_DIMENSION, METRIC)
+        annoy_index.load(f"{vrm}_annoy_index.ann")
+        os.remove(f"{vrm}_annoy_index.ann")
+        bm25 = supabase.storage.from_("repair_tasks").download(f"pkl/{vrm}_bm25.pkl")
+        with open(f"{vrm}_bm25.pkl", "rb") as f:
+            bm25 = pickle.load(f)
+        os.remove(f"{vrm}_bm25.pkl")
+        return full_repair_tree, annoy_index, bm25
+    except Exception as e:
+        # The Supabase Storage API returns a 404 (Not Found) for a missing file.
+        # The Python client translates this into a StorageException.
+        if "The resource was not found" in str(e) or "404" in str(e):
+            print(f"❌ Object not found at '{path}'.")
+            return False, None
+        else:
+            # Handle other errors (e.g., RLS policy, connection issue)
+            print(f"⚠️ An unexpected error occurred: {e}")
+            return False, None
+    
+def log_haynes_pro_request(tenant_code: str,
+    service: str,
+    vin: str,
+    base_url: str,
+    full_url: str,
+    timestamp: str,
+    api_key: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Sends a POST request to the InsertApiLog endpoint to create a new log entry.
+
+    Args:
+        tenant_code: The tenant code (e.g., "qpg-test").
+        service: The service name (e.g., "Full Service").
+        vin: The Vehicle Identification Number.
+        base_url: The base URL of the request.
+        full_url: The full URL of the request.
+        timestamp: The timestamp of the log entry (ISO 8601 format, e.g., "2025-03-07T15:50:00").
+        api_key: Optional API key. Uses the default key if None.
+
+    Returns:
+        A dictionary containing the response JSON (e.g., {"id": "..."}) 
+        or None if the request fails.
+    """
+    
+    URL = "https://tablet-beta.moxhamconsultants.com:3131/PartsApis/InsertApiLog"
+    DEFAULT_API_KEY = os.getenv("TOBY_API_KEY")
+    
+    # Use the provided key or the default
+    key_to_use = api_key if api_key else DEFAULT_API_KEY
+    
+    # 2. Construct the request headers
+    # Content-Type is important to tell the server the body is JSON
+    # The API Key is sent in the custom 'ApiKey' header
+    headers = {
+        "ApiKey": key_to_use,
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        # Including a User-Agent is good practice, mimicking a known client if necessary
+        "User-Agent": "PythonRequestsScript" 
+    }
+    
+    # 3. Construct the JSON payload
+    payload = {
+        "tenantCode": tenant_code,
+        "service": service,
+        "vin": vin,
+        "base_url": base_url,
+        "full_url": full_url,
+        "timestamp": timestamp
+    }
+    
+    print(f"Attempting to log data to {URL}...")
+    
+    try:
+        # 4. Send the POST request
+        # The 'json=' parameter in requests automatically serializes the dictionary
+        # to a JSON string and sets the Content-Type header to application/json
+        response = requests.post(URL, headers=headers, json=payload, timeout=10)
+
+        # 5. Check for a successful response status code (e.g., 201 Created)
+        response.raise_for_status() 
+        # If the response status is 4xx or 5xx, this line will raise an HTTPError
+
+        # 6. Parse and return the JSON response
+        log_id = response.json()
+        print(f"Successfully created log. Log ID: {log_id.get('id')}")
+        return log_id
+
+    except requests.exceptions.RequestException as e:
+        # Handle various request errors (connection, timeout, HTTP status errors)
+        print(f"An error occurred while sending the POST request: {e}")
+        # Print the response text for more details if an HTTP error occurred
+        if 'response' in locals() and hasattr(response, 'text'):
+            print(f"Server response (if available): {response.text}")
+        return None
+    except json.JSONDecodeError:
+        print("Error: Received a successful status code but the response was not valid JSON.")
+        return None
+
+def auth() -> str:
+    """
+    Authentication function that returns a bearer token.
+    This function is called on server startup and every 23 hours.
+    Currently empty - to be implemented with actual authentication logic.
+    """
+    global bearer_token
+    global GLOBAL_HEADERS
+    global DOMAIN
+    global gen_model 
+    global full_repair_tree
+    global model
+    global bm25
+    global annoy_index
+    
+    
+    gen_model = genai.Client(api_key=GEMINI_API_KEY)
+    DOMAIN = "https://apiuat.haynesquoteengine.co.uk"
+    auth_url = f"{DOMAIN}/api/v1/authenticate"
+    auth_headers = {
+        "applicationId": "35"
+    }
+
+    try:
+        response = requests.get(auth_url, headers=auth_headers, auth=HTTPBasicAuth(QUOTE_API_USERNAME, QUOTE_API_PASSWORD))
+        try:
+            json_response = response.json()
+            print("Response Body (JSON):", json.dumps(json_response, indent=2))
+            token = json_response["token"]
+        except json.JSONDecodeError:
+            print("Response Body (Text):", response.text)
+            token = response.text
+    except requests.exceptions.RequestException as e:
+        print(f"An error occurred: {e}")
+        if 'response' in locals() and response is not None:
+             print(f"Error Response Body: {response.text}")
+        token = None
+
+    bearer_token = token
+    GLOBAL_HEADERS = {"Authorization": f"Bearer {bearer_token}","Content-Type": "application/json"}
+    print(f"Auth function called - token updated: {bearer_token}")
+    return token
+
+def schedule_auth_refresh():
+    """
+    Schedule the next auth refresh in 23 hours.
+    """
+    def refresh_and_reschedule():
+        auth()
+        schedule_auth_refresh()
+    
+    # Schedule next refresh in 23 hours (23 * 60 * 60 seconds)
+    timer = Timer(23 * 60 * 60, refresh_and_reschedule)
+    timer.daemon = True  # Dies when main thread dies
+    timer.start()
+    print("Auth refresh scheduled for 23 hours from now")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     print("Starting up...")
     global model
-    model = sentence_transformers.SentenceTransformer('intfloat/e5-base-v2')
+    model = SentenceTransformer('intfloat/e5-base-v2')
+    
+    # Call auth function on startup and schedule periodic refresh
+    auth()
+    schedule_auth_refresh()
+    
     yield
     print("Shutting down...")
     model = None
@@ -62,520 +299,398 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def find_best_match(job_description: str, items_list: List[dict], text_key: str = "name") -> Optional[tuple]:
+    
+def tokenize(text: str) -> List[str]:
     """
-    Finds the best matching item from a list based on semantic similarity to the job_description.
+    Simple tokenizer that converts text to lowercase and splits on word boundaries.
+    """
+    # Convert to lowercase and split on non-alphanumeric characters
+    tokens = re.findall(r'\w+', text.lower())
+    return tokens
 
+def search_bm25(query_text: str, bm25_index: BM25Okapi, top_k: int = 10) -> List[Dict]:
+    """
+    Performs a keyword-based BM25 search.
+    
     Args:
-        job_description: The text description to match against.
-        items_list: A list of dictionaries, where each dictionary represents an item.
-        text_key: The key in each dictionary that contains the text to compare.
-
+        query_text: The search query
+        bm25_index: The BM25 index
+        top_k: Number of top results to return
+    
     Returns:
-        A tuple (item_id, item_text, item_object) for the best match, or None if no match is found.
+        List of dictionaries containing index, awNumber, description, and BM25 score
     """
-    #model = sentence_transformers.SentenceTransformer('intfloat/e5-base-v2')
-    job_description_embedding = model.encode(job_description)
-    best_match_similarity = -1.0  # Cosine similarity ranges from -1 to 1
-    best_match_details = None
-
-    if not items_list:
-        return None
+    global REPAIR_TASKS, REPAIR_DESCRIPTIONS
     
-    print(f"items_list: {items_list}")
-
-    for item in items_list:
-        item_text = item.get(text_key)
-        if not item_text:
-            continue
-
-        item_embedding = model.encode(item_text)
-        # Ensure embeddings are 1-D arrays for dot product
-        job_desc_emb_flat = job_description_embedding.flatten()
-        item_emb_flat = item_embedding.flatten()
-
-        cosine_similarity = np.dot(job_desc_emb_flat, item_emb_flat) / \
-                            (np.linalg.norm(job_desc_emb_flat) * np.linalg.norm(item_emb_flat))
-        
-        if cosine_similarity > best_match_similarity:
-            best_match_similarity = cosine_similarity
-            best_match_details = (item.get("id"), item_text, item)
-            
-    return best_match_details
-
-def chose_category(job_title: str, model_type: str) -> str:
-    categories = ["ENGINE","TRANSMISSION","STEERING","BRAKES","EXTERIOR","ELECTRONICS","QUICKGUIDES"]
-    if model_type == "gemini":
-        gen_model = genai.Client(api_key=GEMINI_API_KEY)
-        prompt = f"Given the following job description: {job_title}, choose the most appropriate category from the following list: {categories}. Only return the category, no other text."
-        response = gen_model.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt
-        )
-        return response.text
-    elif model_type == "sentence_transformer":
-        #model = sentence_transformers.SentenceTransformer('all-MiniLM-L6-v2')
-        job_description_embedding = model.encode(job_title)
-        best_match_similarity = -1.0
-        best_match_details = None
-        for category in categories:
-            category_embedding = model.encode(category)
-            cosine_similarity = np.dot(job_description_embedding, category_embedding) / \
-                                (np.linalg.norm(job_description_embedding) * np.linalg.norm(category_embedding))
-            if cosine_similarity > best_match_similarity:
-                best_match_similarity = cosine_similarity
-                best_match_details = category
-        return best_match_details
-    else:
-        print("Invalid model: Select gemini or sentence_transformer")
-        return None
-
-def log_api_call(endpoint: str, tenant: str, vin: str, full_url: str, method: str = "GET"):
-    """
-    Log individual API call information to Supabase table
+    # Tokenize the query
+    tokenized_query = tokenize(query_text)
     
-    Args:
-        endpoint: The internal endpoint being called (analyse-job, haynes-pro, etc.)
-        tenant: The tenant making the call
-        vin: The VIN number for the call
-        full_url: The full URL being called
-        method: HTTP method (GET, POST, etc.)
-    """
-    try:
-        # Extract base URL from full URL
-        from urllib.parse import urlparse
-        parsed_url = urlparse(full_url)
-        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        
-        call_data = {
-            "endpoint": endpoint,
-            "tenant": tenant,
-            "vin": vin,
-            "base_url": base_url,
-            "full_url": full_url,
-            "method": method,
-            "timestamp": datetime.utcnow().isoformat(),
-            "call_count": 1
-        }
-        
-        result = supabase.table("api_calls").insert(call_data).execute()
-        logger.info(f"API call logged: {method} {full_url} for tenant {tenant}")
-        
-    except Exception as e:
-        logger.error(f"Failed to log API call: {e}")
-        # Don't raise the exception to avoid breaking the main API functionality
+    # Get BM25 scores for all documents
+    scores = bm25_index.get_scores(tokenized_query)
+    
+    # Get top-k indices
+    top_indices = np.argsort(scores)[::-1][:top_k]
+    
+    # Format results
+    results = []
+    print(REPAIR_TASKS)
+    for idx in top_indices:
+        results.append({
+            "index": int(idx),
+            "awNumber": REPAIR_TASKS[idx]["awNumber"],
+            "description": REPAIR_DESCRIPTIONS[idx],
+            "bm25_score": float(scores[idx])
+        })
+    
+    return results
 
-# --- Helpers for building full repair tree ---
+def search_annoy_index(query_text, annoy_index, model, top_k=2):
+    """
+    Performs a semantic search against the in-memory Annoy index.
+    """
+    global REPAIR_TASKS, REPAIR_DESCRIPTIONS
+    
+    # 1. Convert the query text into a vector using the same model
+    query_vector = model.encode(query_text)
 
-def _fetch_repair_subnodes(vrid: str, repairtime_type_id: int, type_category: str, node_id: str, description_language: str = "en") -> list:
-    """
-    Fetch one level of subnodes for a given nodeId.
-    """
-    subnodes_url = (
-        f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/"
-        f"getRepairtimeSubnodesByGroupV4?vrid={vrid}&descriptionLanguage={description_language}"
-        f"&repairtimeTypeId={repairtime_type_id}&typeCategory={type_category}&nodeId={node_id}"
+    # 2. Perform the Approximate Nearest Neighbors (ANN) Search
+    # get_nns_by_vector returns the internal IDs (indices) and their distances
+    # n=top_k specifies how many nearest neighbors to retrieve
+    indices, distances = annoy_index.get_nns_by_vector(
+        query_vector, 
+        n=top_k, 
+        include_distances=True
     )
-    response = requests.get(subnodes_url)
-    try:
-        return response.json()
-    except Exception:
-        return []
 
+    # 3. Format Results
+    results = []
+    for index, distance in zip(indices, distances):
+        results.append({
+            "index": index,
+            "awNumber": REPAIR_TASKS[index]["awNumber"],
+            "description": REPAIR_DESCRIPTIONS[index],
+            "similarity_score": round(1 - distance**2 / 2, 4) # Convert angular distance to cosine similarity
+        })
+        
+    return results
 
-def build_full_repair_tree(vrid: str, repairtime_type_id: int, type_category: str, description_language: str = "en", root_node_id: str = "root") -> dict:
+@app.post("/create-tree-async")
+async def build_full_repair_tree(data: CreateTreeJobData) -> dict:
     """
     Recursively traverse all subnodes starting from root and return the entire tree structure.
+    Uses async/await with parallel API calls for dramatic performance improvement.
     """
-    visited = set()
-    api_call_count = 0
+    global api_call_count
+    global REPAIR_TASKS
+    global REPAIR_DESCRIPTIONS
+    global bm25
+    global annoy_index
+    api_call_count = 0 # Reset counter for a fresh call
+    
+    try:
+        full_repair_tree, annoy_index, bm25 = download_from_supabase(data.vrm)
+        root_node_structure = full_repair_tree
+        return root_node_structure
+    except Exception as e:
+        print(f"VRM not found in database: {e}")
+        # Define the structure for the root node
+        root_node_structure = {
+            "awNumber": "root", # The ID of the root itself
+            "description": "Root Node", # Placeholder description for the initial ID
+            "parentNodeId": None,
+            "childTasks": []
+        }
 
-    def dfs(node_id: str, parent_id: Optional[str]) -> dict:
-        nonlocal api_call_count
-        # Prevent accidental cycles
-        if node_id in visited:
-            return {"nodeId": node_id, "parent": parent_id, "groups": []}
-        visited.add(node_id)
+        # Use aiohttp session for connection pooling`1  `
+        async with aiohttp.ClientSession() as session:
+            root_node_structure["childTasks"] = await _dfs_async("root", "", data.vrm, data.tenant, session)
+    
+            
+        REPAIR_TASKS = extract_tasks_dfs(root_node_structure.get("childTasks"))
+        REPAIR_DESCRIPTIONS = [task["description"] for task in REPAIR_TASKS]
+        with open(f"{data.vrm}_repair_tasks.json", "w") as f:
+            json.dump({"tasks": REPAIR_TASKS, "descriptions": REPAIR_DESCRIPTIONS}, f)
+        upload_to_supabase(f"{data.vrm}_repair_tasks.json")
+        
+        # Debug: Check which descriptions don't have enough elements
+        print(f"Total descriptions: {len(REPAIR_DESCRIPTIONS)}")
+        for idx, desc in enumerate(REPAIR_DESCRIPTIONS):
+            parts = desc.split(" -> ")
+            if len(parts) < 2:
+                print(f"WARNING - Description at index {idx} has only {len(parts)} part(s):")
+                print(f"  Description: '{desc}'")
+                print(f"  Task awNumber: {REPAIR_TASKS[idx]['awNumber']}")
+        
+        # Robust tokenization: use second-to-last element if available, otherwise use the last element
+        tokenized_descriptions = []
+        for desc in REPAIR_DESCRIPTIONS:
+            parts = desc.split(" -> ")
+            if len(parts) >= 2:
+                tokenized_descriptions.append(tokenize(parts[-2]))
+            else:
+                # Fallback: use the entire description or last part
+                tokenized_descriptions.append(tokenize(parts[-1] if parts else ""))
+        bm25 = BM25Okapi(tokenized_descriptions)
+        vectors = model.encode(REPAIR_DESCRIPTIONS)
+        annoy_index = AnnoyIndex(VECTOR_DIMENSION, METRIC)
 
-        api_call_count += 1
-        groups = _fetch_repair_subnodes(vrid, repairtime_type_id, type_category, node_id, description_language)
-        result_groups = []
+        for i, vector in enumerate(vectors):
+            annoy_index.add_item(i, vector)
 
-        for group in groups:
-            group_id = group.get("id")
-            # Basic shape we keep from the API
-            node = {
-                "id": group_id,
-                "description": group.get("description"),
-                "hasSubnodes": group.get("hasSubnodes", False),
-                "hasInfoGroups": group.get("hasInfoGroups", False),
-                "value": group.get("value"),
-                "parent": node_id,
-                "children": []
-            }
-
-            if group.get("hasSubnodes", False) is True:
-                node["children"] = dfs(group_id, node_id).get("groups", [])
-
-            result_groups.append(node)
-
-        return {"nodeId": node_id, "parent": parent_id, "groups": result_groups}
-
-    root = dfs(root_node_id, None)
-    root["api_call_count"] = api_call_count
-    return root
+        annoy_index.build(NUM_TREES)
+        annoy_index.save(f"{data.vrm}_annoy_index.ann")
+        
+        pickle_object(bm25, f"{data.vrm}_bm25.pkl")
+        
+        upload_to_supabase(f"{data.vrm}_annoy_index.ann")
+        upload_to_supabase(f"{data.vrm}_bm25.pkl")
+        full_repair_tree = root_node_structure
+        
+        with open(f"{data.vrm}_repair_tree.json", "w") as f:
+            json.dump(root_node_structure, f)
+        upload_to_supabase(f"{data.vrm}_repair_tree.json")
+        
+        # Add the API call count to the final structure
+        #root_node_structure["api_call_count"] = api_call_count
+        
+        return root_node_structure
 
 
-def save_tree_json(tree: dict, vin: str) -> str:
+async def _fetch_repair_subnodes_async(vrm: str, awnumber: str, tenant: str, session: aiohttp.ClientSession) -> list:
     """
-    Save the tree to src/backend/jsons/<vin>_repair_tree.json and return the file path.
+    Async version: Fetch one level of subnodes for a given nodeId.
     """
-    directory = os.path.join("src", "backend", "jsons")
-    os.makedirs(directory, exist_ok=True)
-    filename = f"{vin}_repair_tree.json"
-    path = os.path.join(directory, filename)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(tree, f, ensure_ascii=False, indent=2)
-    return path
+    global api_call_count
+    api_call_count += 1
+    
+    subnodes_url = f"https://apiuat.haynesquoteengine.co.uk/api/v1/RepairTree/{vrm}/Layer/{awnumber}"
+    log_haynes_pro_request(tenant, "Repair Tree Subnodes (Building repair tree)", vrm, f"{DOMAIN}", subnodes_url, datetime.now().isoformat())
+    
+    try:
+        async with session.get(subnodes_url, headers=GLOBAL_HEADERS) as response:
+            return await response.json()
+    except Exception as e:
+        print(f"Error fetching subnodes for {awnumber}: {e}")
+        return []
+
+async def _dfs_async(node_id: str, path: str, vrm: str, tenant: str, session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+    """
+    Async helper DFS function to recursively fetch and build the subtree for a given node_id.
+    Fetches all sibling nodes in parallel for dramatic performance improvement.
+    
+    Args:
+        node_id: The ID of the node whose direct children are to be fetched.
+        path: The path taken to get to the current node.
+        vrm: The VRM parameter for the API call.
+        session: Aiohttp session for connection pooling.
+
+    Returns:
+        A list of dictionaries, where each dictionary is a child node with its full subtree.
+    """
+    
+    # 1. Fetch direct subnodes for the current node_id
+    child_tasks_data = await _fetch_repair_subnodes_async(vrm, node_id, tenant, session)
+    
+    # 2. Initialize the list to hold the structured child nodes
+    structured_children: List[Dict[str, Any]] = []
+
+    # 3. Process each direct subnode and prepare async tasks for children with subnodes
+    async_tasks = []
+    nodes_with_tasks = []
+    
+    for task in child_tasks_data:
+        # Create the node structure
+        node = {
+            "awNumber": task["awNumber"],
+            "description": path + " -> " + task["description"],
+            "parentNodeId": node_id,
+            "childTasks": []
+        }
+        
+        structured_children.append(node)
+        
+        # 4. If this node has children, prepare an async task to fetch them in parallel
+        if task["hasChildren"]:
+            nodes_with_tasks.append(node)
+            async_tasks.append(_dfs_async(task["awNumber"], node["description"], vrm, tenant, session))
+    
+    # 5. Execute all child fetches in parallel
+    if async_tasks:
+        results = await asyncio.gather(*async_tasks)
+        
+        # 6. Assign results back to the corresponding nodes
+        for node, child_result in zip(nodes_with_tasks, results):
+            node["childTasks"] = child_result
+        
+    # 7. Return the list of children for the current node_id
+    return structured_children
+
+def extract_tasks_dfs(repair_tree_json):
+    """
+    Performs a Depth-First Search on the repair tree structure to extract all
+    task AW numbers and descriptions at the leaf nodes.
+
+    Args:
+        repair_tree_json: A JSON string or list of dictionaries representing the repair tree.
+
+    Returns:
+        A list of dictionaries, where each dictionary contains 'awNumber' and 'description'
+        for a task.
+    """
+    if isinstance(repair_tree_json, str):
+        data = json.loads(repair_tree_json)
+    else:
+        data = repair_tree_json
+
+    all_tasks = []
+
+    def dfs(nodes):
+        print(f"nodes: {type(nodes)}")
+        for node in nodes:
+            print(f"node: {node}")
+            # Add the current node's task to the list
+            if not node.get('childTasks'):
+              all_tasks.append({
+                  'awNumber': node.get('awNumber'),
+                  'description': node.get('description')
+              })
+
+            # Recursively call DFS for child tasks if they exist
+            if 'childTasks' in node and node['childTasks']:
+                dfs(node['childTasks'])
+
+    # The top level of your JSON is a list of root nodes
+    dfs(data)
+
+    return all_tasks
+    
+
 
 # --- API Endpoints ---
-
-@app.post("/analyse-job")
-def analyse_job(job_data: JobData) -> List[Parts]:
-    """
-    Analyse a job description and return a list of parts that are needed.
-    """
-    car_info_url = f"https://api.parts-catalogs.com/v1/car/info?q={job_data.vin}"
-    log_api_call("analyse-job", job_data.tenant, job_data.vin, car_info_url)
-    car_info = requests.get(car_info_url, headers={"Authorization": f"{API_KEY}"})
-    if car_info.status_code == 200:
-        catalog_id = car_info.json()[0]["catalogId"]
-        car_id = car_info.json()[0]["carId"]
-        group_id = None
-    else:
-        catalog_id = "skoda"
-        car_id = "6f02b148166fda26b20d2e22da07b4d8"
-        
-    parts_list = []
-    
-    for work_item in job_data.workItems:
-        has_parts = False
-        group_id = None
-        while has_parts!=True:
-            if group_id is None:
-                groups_url = f"https://api.parts-catalogs.com/v1/catalogs/{catalog_id}/groups2?carId={car_id}"
-                log_api_call("analyse-job", job_data.tenant, job_data.vin, groups_url)
-                groups_response = requests.get(groups_url, headers={"Authorization": f"{API_KEY}"})
-                print(groups_response.json())
-                best_match_group = find_best_match(work_item.description, groups_response.json())
-                #print("work item: ", work_item.description)
-                #print("best match group: ", best_match_group)
-                group_id = best_match_group[0]
-                if groups_response.json()[best_match_group[2]]["hasParts"] is True:
-                    has_parts = True
-                    print(groups_response.json()[best_match_group[2]]["name"] + " has parts")
-            else:
-                group_url = f"https://api.parts-catalogs.com/v1/catalogs/{catalog_id}/groups2?carId={car_id}&groupId={group_id}"
-                log_api_call("analyse-job", job_data.tenant, job_data.vin, group_url)
-                group_response = requests.get(group_url, headers={"Authorization": f"{API_KEY}"})
-                best_match_group = find_best_match(work_item.description, group_response.json())
-                #print(best_match_group)
-                group_id = best_match_group[0]
-                if group_response.json()[best_match_group[2]]["hasParts"] is True:
-                    has_parts = True
-                    print(group_response.json()[best_match_group[2]]["name"] + " has parts")
-                    
-        parts_url = f"https://api.parts-catalogs.com/v1/catalogs/{catalog_id}/parts2?carId={car_id}&groupId={group_id}"
-        log_api_call("analyse-job", job_data.tenant, job_data.vin, parts_url)
-        parts_response = requests.get(parts_url, headers={"Authorization": f"{API_KEY}"})
-        parts = parts_response.json()
-        parts_list.append(parts)
-    print(parts_list)
-    return parts_list
 
 
 @app.post("/haynes-pro")
 def haynes_pro(job_data: HaynesProJobData):
-    try:
+    if "full service" in job_data.workItems[0].title.lower():
         results_list = []
-        auth_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getAuthenticationVrid?distributorUsername={HAYNES_PRO_USERNAME}&distributorPassword={HAYNES_PRO_PASSWORD}&username=jnpda2025"
-        log_api_call("haynes-pro", job_data.tenant, job_data.vin, auth_url)
-        response = requests.get(auth_url)
-        if response.json()["statusCode"] == 0:
-            vrid = response.json()["vrid"]
-        else:
-            print(response.text)
-            exit()
-
-        # 2. Decode VIN
-        vin_decode_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/decodeVINV4?vrid={vrid}&vin={job_data.vin}&descriptionLanguage=en"
-        log_api_call("haynes-pro", job_data.tenant, job_data.vin, vin_decode_url)
-        vin_decode_response = requests.get(vin_decode_url)
-        if vin_decode_response.status_code != 200:
-            print(f"Haynes Pro VIN decoding failed: {vin_decode_response.text}")
-            return {"error": "Haynes Pro VIN decoding failed", "details": vin_decode_response.text}
+        service_systems_response = requests.get(f"{DOMAIN}/api/v1/RepairTree/{job_data.vrm}/services",headers=GLOBAL_HEADERS)
+        log_haynes_pro_request(job_data.tenant, "Repair Tree Service Systems", job_data.vrm, f"{DOMAIN}/api/v1/", service_systems_response.url, datetime.now().isoformat())
+        service_systems = service_systems_response.json()
+        print(f"service systems: {service_systems}")
         
-        vehicle_info_list = vin_decode_response.json()
-        if not vehicle_info_list or not isinstance(vehicle_info_list, list) or not vehicle_info_list[0].get("id"):
-            print(f"Invalid vehicle info from VIN decode: {vehicle_info_list}")
-            return {"error": "Invalid vehicle info from Haynes Pro", "details": vehicle_info_list}
-        car_type_id = vehicle_info_list[0]["id"]
-        print(f"car type id: {car_type_id}")
-
-        # 3. Get Repair Time Types (e.g., Standard Times)
-        rt_types_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeTypesV2?vrid={vrid}&carTypeId={car_type_id}&descriptionLanguage=en"
-        log_api_call("haynes-pro", job_data.tenant, job_data.vin, rt_types_url)
-        rt_types_response = requests.get(rt_types_url)
-        if rt_types_response.status_code != 200:
-            print(f"Failed to get repair time types: {rt_types_response.text}")
-            return {"error": "Failed to get repair time types", "details": rt_types_response.text}
-
-        repairtime_types = rt_types_response.json()
-        if not repairtime_types or not isinstance(repairtime_types, list):
-            print(f"No repair time types found: {repairtime_types}")
-            return {"error": "No repair time types found", "details": repairtime_types}
-        
-        """For now we only use the first repair time type but going forward we should add a search for the best match"""
-        target_repairtime_type = repairtime_types[0]
-        target_repairtime_type_id = target_repairtime_type['repairtimeTypeId']
-        print(f"target repair time type id: {target_repairtime_type_id}")
-        type_category = target_repairtime_type.get('typeCategory', 'CAR')
-        
-        car_type_group = chose_category(job_data.workItems[0].title, "sentence_transformer")
-        print(f"job title: {job_data.workItems[0].title}")
-        print(f"car type group: {car_type_group}")
-        
-        matched_work_items = []
-        for work_item in job_data.workItems:
-            nodeId = "root"
-            has_subnodes = True
-            while has_subnodes:
-                main_groups_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeSubnodesByGroupV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}&carTypeGroup={car_type_group}"
-                log_api_call("haynes-pro", job_data.tenant, job_data.vin, main_groups_url)
-                main_groups_resp = requests.get(main_groups_url).json()
-                main_groups = [group for group in main_groups_resp if group.get("hasSubnodes", False) is True or group.get("hasInfoGroups", False) is True]
-                # find the best match for the work item in the main groups
-                best_match_group = find_best_match(work_item.title, main_groups, text_key="description")
-                if best_match_group:
-                    nodeId = best_match_group[0]
-                    has_subnodes = best_match_group[2].get("hasSubnodes", False)
-                else:
-                    has_subnodes = False
-                    
-                print(f"best match group: {best_match_group}")
-                if has_subnodes==False:
-                    print(main_groups)
-                    matched_work_items.append({"nodeId": nodeId, "description": best_match_group[2].get("description"), "work_item": work_item, "main_groups": main_groups, "value": best_match_group[2].get("value")})
-        
-        for work_item in matched_work_items:
-            #print(f"work item: {work_item}")
-            nodeId = work_item.get("nodeId")
-            repairtime_infos_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeInfosV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}"
-            log_api_call("haynes-pro", job_data.tenant, job_data.vin, repairtime_infos_url)
-            response = requests.get(repairtime_infos_url)
-            repairtime_infos = response.json()
-            print(f"repairtime infos: {repairtime_infos}")
-            results_list.append({"car_type_id": car_type_id, "nodeId": nodeId, "description": work_item.get("description"), "repairtime_infos": repairtime_infos, "main_groups": work_item.get("main_groups"), "value": work_item.get("value")})
-    except Exception as e:
-        print(e)
-        print(traceback.format_exc())
-        return {"title":"error"}
-    return {
-        "results": results_list,
-        "tree_structure": tree_structure,
-        "matched_work_items": matched_work_items
-    }
-
-def repair_tasks(job_data, vrid, car_type_id):
-    try:
-        results_list = []
-        #text_search = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeSubnodesTextSearchV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}&carTypeGroup={car_type_group}&searchText={job_data.workItems[0].title}"
-        #log_api_call("haynes-pro", job_data.tenant, job_data.vin, text_search)
-        #text_search_response = requests.get(text_search)
-        #text_search_response = text_search_response.json()
-        #print(f"text search response: {text_search_response}")
-        #return text_search_response
-    
-        
-        
-        # 3. Get Repair Time Types (e.g., Standard Times)
-        rt_types_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeTypesV2?vrid={vrid}&carTypeId={car_type_id}&descriptionLanguage=en"
-        log_api_call("haynes-pro", job_data.tenant, job_data.vin, rt_types_url)
-        rt_types_response = requests.get(rt_types_url)
-        if rt_types_response.status_code != 200:
-            print(f"Failed to get repair time types: {rt_types_response.text}")
-            return {"error": "Failed to get repair time types", "details": rt_types_response.text}
-
-        repairtime_types = rt_types_response.json()
-        print(f"repair time types: {repairtime_types}")
-        if not repairtime_types or not isinstance(repairtime_types, list):
-            print(f"No repair time types found: {repairtime_types}")
-            return {"error": "No repair time types found", "details": repairtime_types}
-        
-        """For now we only use the first repair time type but going forward we should add a search for the best match"""
-        target_repairtime_type = repairtime_types[0]
-        target_repairtime_type_id = target_repairtime_type['repairtimeTypeId']
-        print(f"target repair time type id: {target_repairtime_type_id}")
-        type_category = target_repairtime_type.get('typeCategory', 'CAR')
-        
-        car_type_group = chose_category(job_data.workItems[0].title, "sentence_transformer")
-        print(f"job title: {job_data.workItems[0].title}")
-        print(f"car type group: {car_type_group}")
-        
-        matched_work_items = []
-        tree_structure = {}  # Dictionary to store the complete tree structure
-
-        for work_item in job_data.workItems:
-            nodeId = "root"
-            has_subnodes = True
-            work_item_tree = {}  # Tree structure for this specific work item
-            current_path = []  # Track the path through the tree
-
-            while has_subnodes:
-                #main_groups_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeSubnodesByGroupV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}"
-                main_groups_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeSubnodesTextSearchV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}&searchText={work_item.invoice_description}"#&carTypeGroup={car_type_group}
-                log_api_call("haynes-pro", job_data.tenant, job_data.vin, main_groups_url)
-                main_groups_resp = requests.get(main_groups_url).json()
-                main_groups = [group for group in main_groups_resp]
-
-                # Save this level to the global tree structure
-                level_key = f"{work_item.title}_{nodeId}"
-                if level_key not in tree_structure:
-                    tree_structure[level_key] = {
-                        "nodeId": nodeId,
-                        "parent_path": current_path.copy(),
-                        "groups": main_groups,
-                        "work_item_title": work_item.title,
-                        "level": len(current_path)
-                    }
-
-                # Also save to work item specific tree
-                path_key = "_".join(current_path + [nodeId]) if current_path else nodeId
-                work_item_tree[path_key] = {
-                    "nodeId": nodeId,
-                    "groups": main_groups,
-                    "level": len(current_path)
-                }
-
-                # find the best match for the work item in the main groups
-                best_match_group = find_best_match(work_item.title, main_groups, text_key="description")
-                if best_match_group:
-                    current_path.append(nodeId)  # Add current node to path
-                    nodeId = best_match_group[0]
-                    has_subnodes = best_match_group[2].get("hasSubnodes", False)
-                else:
-                    has_subnodes = False
-
-                print(f"best match group: {best_match_group}")
-                if has_subnodes==False:
-                    print(main_groups)
-                    matched_work_items.append({
-                        "nodeId": nodeId,
-                        "description": best_match_group[2].get("description") if best_match_group else None,
-                        "work_item": work_item,
-                        "main_groups": main_groups,
-                        "value": best_match_group[2].get("value") if best_match_group else None,
-                        "tree_path": current_path.copy(),
-                        "work_item_tree": work_item_tree
-                    })
-        
-        for work_item in matched_work_items:
-            #print(f"work item: {work_item}")
-            nodeId = work_item.get("nodeId")
-            repairtime_infos_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeInfosV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={target_repairtime_type_id}&typeCategory={type_category}&nodeId={nodeId}"
-            print(f"repairtime infos url: {repairtime_infos_url}")
-            log_api_call("haynes-pro", job_data.tenant, job_data.vin, repairtime_infos_url)
-            response = requests.get(repairtime_infos_url)
-            repairtime_infos = response.json()
-            print(f"repairtime infos: {repairtime_infos}")
-            results_list.append({"car_type_id": car_type_id, "nodeId": nodeId, "description": work_item.get("description"), "repairtime_infos": repairtime_infos, "main_groups": work_item.get("main_groups"), "value": work_item.get("value")})
-    except Exception as e:
-        print(e)
-        print(traceback.format_exc())
-        return {"title":"error"}
-    return {
-        "results": results_list,
-        "tree_structure": tree_structure,
-        "matched_work_items": matched_work_items,
-        "vrid": vrid,
-        "type_category": type_category,
-        "target_repairtime_type_id": target_repairtime_type_id
-    }
-    
-@app.post("/create-tree")
-def create_tree(job_data: CreateTreeJobData):
-    try:
-        # 1) Authenticate
-        auth_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getAuthenticationVrid?distributorUsername={HAYNES_PRO_USERNAME}&distributorPassword={HAYNES_PRO_PASSWORD}&username=jnpda2025"
-        auth_resp = requests.get(auth_url)
-        auth_json = auth_resp.json()
-        if auth_json.get("statusCode") != 0:
-            return {"title": "error", "message": "Authentication failed", "details": auth_json}
-        vrid = auth_json.get("vrid")
-
-        # 2) Decode VIN
-        vin_decode_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/decodeVINV4?vrid={vrid}&vin={job_data.vin}&descriptionLanguage=en"
-        vin_decode_response = requests.get(vin_decode_url)
-        if vin_decode_response.status_code != 200:
-            return {"title": "error", "message": "VIN decode failed", "details": vin_decode_response.text}
-        vehicle_info_list = vin_decode_response.json()
-        if not vehicle_info_list or not isinstance(vehicle_info_list, list) or not vehicle_info_list[0].get("id"):
-            return {"title": "error", "message": "Invalid vehicle info", "details": vehicle_info_list}
-        car_type_id = vehicle_info_list[0]["id"]
-
-        # 3) Get repair time type (take first)
-        rt_types_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeTypesV2?vrid={vrid}&carTypeId={car_type_id}&descriptionLanguage=en"
-        rt_types_response = requests.get(rt_types_url)
-        if rt_types_response.status_code != 200:
-            return {"title": "error", "message": "Failed to get repair time types", "details": rt_types_response.text}
-        repairtime_types = rt_types_response.json()
-        if not repairtime_types or not isinstance(repairtime_types, list):
-            return {"title": "error", "message": "No repair time types found", "details": repairtime_types}
-        target_repairtime_type_id = repairtime_types[0]['repairtimeTypeId']
-        type_category = repairtime_types[0].get('typeCategory', 'CAR')
-
-        # 4) Build full tree recursively from root
-        tree = build_full_repair_tree(
-            vrid=vrid,
-            repairtime_type_id=target_repairtime_type_id,
-            type_category=type_category,
-            description_language="en",
-            root_node_id="root"
+        chosen_service = gen_model.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=f"We are looking to do a time/mileage maintenance service for this vehicle. It uses {job_data.fuel} fuel and was manufactured in {job_data.manufacture_date}. Given the following service systems: {service_systems}, return the most appropriate service system. Return only the id and name of the service system in a json format.",
         )
+        print(chosen_service.text)
+        log_haynes_pro_request(job_data.tenant, "Gemini Service System Selection", job_data.vrm, f"https://generativelanguage.googleapis.com/v1beta/", "https://generativelanguage.googleapis.com/v1beta/{model=models/*}:generateContent", datetime.now().isoformat())
+        chosen_service_id = chosen_service.text.split("```json")[1].split("```")[0]
+        chosen_service_json = json.loads(chosen_service_id)
+        print(f"chosen service: {chosen_service_json}")
+        
+        
+        maintenace_services_response = requests.get(f"{DOMAIN}/api/v1/RepairTree/{job_data.vrm}/services/{chosen_service_json['serviceId']} ",headers=GLOBAL_HEADERS)
+        log_haynes_pro_request(job_data.tenant, "Repair Tree Maintenance Services", job_data.vrm, f"{DOMAIN}", maintenace_services_response.url, datetime.now().isoformat())
+        maintenance_services = maintenace_services_response.json()
+        maintenance_periods = {period["id"]:period["name"] for period in maintenance_services}
+        print(f"maintenance services: {maintenance_services}")
 
-        # 5) Save JSON file
-        json_path = save_tree_json(tree, job_data.vin)
-
+        days_since_last_service = (datetime.now() - datetime.strptime(job_data.last_service_date, "%Y-%m-%d")).days
+        
+        chosen_maintenance_period = gen_model.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=f"given the following maintenance periods: {maintenance_periods}, and given the vehicle has {job_data.mileage} miles and its last service was {days_since_last_service} days ago, return the most appropriate maintenance period. Return only the id and name of the maintenance period in a json format.",
+        )
+        log_haynes_pro_request(job_data.tenant, "Gemini Maintenance Period Selection", job_data.vrm, f"https://generativelanguage.googleapis.com/v1beta/", "https://generativelanguage.googleapis.com/v1beta/{model=models/*}:generateContent", datetime.now().isoformat())
+        print(chosen_maintenance_period.text)
+        maintenance_period_json = chosen_maintenance_period.text.split("```json")[1].split("```")[0]
+        chosen_maintenance_period_json = json.loads(maintenance_period_json)
+        period_name = chosen_maintenance_period_json['name']
+        print(f"maintenance period id: {chosen_maintenance_period_json}")
+        
+        maintenance_tasks_response = requests.get(f"{DOMAIN}/api/v1/RepairTree/{job_data.vrm}/services/{chosen_service_json['serviceId']}/{chosen_maintenance_period_json['id']}",headers=GLOBAL_HEADERS)
+        log_haynes_pro_request(job_data.tenant, "Repair Tree Maintenance Tasks", job_data.vrm, f"{DOMAIN}", maintenance_tasks_response.url, datetime.now().isoformat())
+        maintenance_tasks = maintenance_tasks_response.json()
+        print(f"maintenance tasks: {maintenance_tasks}")
+        maintenance_tasks = check_maintenance_period(maintenance_tasks, days_since_last_service, int(job_data.mileage))
+        #print(f"maintenance tasks: {maintenance_tasks}")
+        results_list.append({"system_id": chosen_service_json['serviceId'], "period_id": chosen_maintenance_period_json['id'], "maintenance_tasks": maintenance_tasks, "period_name": chosen_maintenance_period_json['name']})
         return {
-            "vrid": vrid,
-            "car_type_id": car_type_id,
-            "target_repairtime_type_id": target_repairtime_type_id,
-            "type_category": type_category,
-            "tree_structure": tree,
-            "json_path": json_path,
-            "api_call_count": tree.get("api_call_count", 0)
+        "results": results_list,
+        "tree_structure": {},
+        "matched_work_items": {}
+    }
+    else:
+        print("repair repair service")
+        try:
+            global REPAIR_TASKS
+            global REPAIR_DESCRIPTIONS
+            global bm25
+            global annoy_index
+            global full_repair_tree
+            
+            results_list = []
+            
+            # Now search for work items
+            for work_item in job_data.workItems:
+                category_match = search_bm25(work_item.title, bm25, top_k=100)
+                semantic_match = search_annoy_index(work_item.title, annoy_index, model, top_k=5)
+                #best_match = find_best_match(work_item.title, REPAIR_TASKS, text_key="description")
+                for match in semantic_match:
+                    aw_number = match["awNumber"]
+                    
+                    # get repair details
+                    repair_detail_response = requests.get(f"{DOMAIN}/api/v1/RepairTree/{job_data.vrm}/Task/{aw_number}", headers=GLOBAL_HEADERS)
+                    log_haynes_pro_request(job_data.tenant, "Repair Tree Task Details", job_data.vrm, f"{DOMAIN}", repair_detail_response.url, datetime.now().isoformat())
+                    repair_detail = repair_detail_response.json()
+                    
+                    print(f"repair detail: {repair_detail}")
+                
+                    results_list.append(repair_detail)
+        except Exception as e:
+            print(e)
+            print(traceback.format_exc())
+            return {"title":"error"}
+    return {
+        "results": results_list,
+        "tree_structure": {},
+        "matched_work_items": results_list
+    }
+    
+@app.post("/get-parts-quotes")
+def get_parts_quotes(job_data: PartsQuoteJobData):
+    suppliers_data = [supplier.model_dump() for supplier in job_data.suppliers]
+    if PARTS_SEARCH_AVAILABLE == "true":
+        parts_search_url = f"{DOMAIN}/api/v1/findparts/searchbygenart"
+        
+        
+        payload = {
+            "Vrm": job_data.vrm,
+            "Genart": job_data.genart,
+            "Suppliers": suppliers_data
         }
-    except Exception as e:
-        print(e)
-        print(traceback.format_exc())
-        return {"title":"error"}
+        parts_search_response = requests.post(parts_search_url, headers=GLOBAL_HEADERS, json=payload)
+        log_haynes_pro_request(job_data.tenant, "Find Parts by Genart", job_data.vrm, f"{DOMAIN}", parts_search_response.url, datetime.now().isoformat())
+        return parts_search_response.json()
+    else:
+        with open("parts_quotes.json", "r") as f:
+            parts_quotes = json.load(f)
+            
+        with open("sample_quotes_response.json", "r") as f:
+            sample_quotes_response = json.load(f)
+            
+        parts_quotes_response = gen_model.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=f"We need to generate some dummy parts quotes for the following vehicle: {job_data.vrm}. The supplier ids are {suppliers_data}. Use the following image urls and brands for the parts. {parts_quotes[str(job_data.genart)]} Return the parts quotes in a json format. {sample_quotes_response}",
+        )
+        log_haynes_pro_request(job_data.tenant, "Gemini Parts Quotes Generation", job_data.vrm, f"https://generativelanguage.googleapis.com/v1beta/", "https://generativelanguage.googleapis.com/v1beta/{model=models/*}:generateContent", datetime.now().isoformat())
+        print(parts_quotes_response.text)
+        
+        parts_quotes_response_json = json.loads(parts_quotes_response.text.split("```json")[1].split("```")[0])
+        print(f"parts quotes response json: {parts_quotes_response_json}")
+        
+        return parts_quotes_response_json
  
-@app.post("/node-search")
-def node_search(job_data: NodeSearchJobData):
-    try:
-        repairtime_infos_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeSubnodesByGroupV4?vrid={job_data.vrid}&descriptionLanguage=en&repairtimeTypeId={job_data.target_repairtime_type_id}&typeCategory={job_data.type_category}&nodeId={job_data.nodeId}"
-        print(f"repairtime infos url: {repairtime_infos_url}")
-        #log_api_call("haynes-pro", job_data.tenant, job_data.vin, repairtime_infos_url)
-        response = requests.get(repairtime_infos_url)
-        repairtime_infos = response.json()
-        return {
-            "groups": repairtime_infos
-        }
-    except Exception as e:
-        print(e)
-        print(traceback.format_exc())
-        return {"title":"error"}
-
 def check_maintenance_period(maintenance_tasks: dict, days_since_last_service: int, mileage: int) -> dict:
     """
     Filter maintenance tasks based on time/mileage requirements in remarks.
@@ -588,274 +703,53 @@ def check_maintenance_period(maintenance_tasks: dict, days_since_last_service: i
     months_since_last_service = days_since_last_service / 30.0
     filtered_tasks = []
     
-    for task in maintenance_tasks.get("subTasks", []):
-        remark = task.get("remark", "").lower()
-        keep_task = False
-        include_as_default = False
+    for task in maintenance_tasks.get("optionalTasks", []):
+        criteria = task.get("criteria", "").lower().replace(",", "")
+        is_mandatory = task.get("isMandatory", False)
         
         # Check month requirements
-        month_matches = re.findall(r'(\d+)\s*months?', remark)
+        month_matches = re.findall(r'(\d+)\s*months?', criteria)
         if month_matches:
             required_months = int(month_matches[0])
             if months_since_last_service >= required_months:
                 # Fully met requirement
-                keep_task = True
-                include_as_default = True
+                is_mandatory = True
             elif months_since_last_service >= (required_months * 0.7):
                 # 70%+ met but not fully
-                keep_task = True
-                include_as_default = False
+                is_mandatory = False
         
         # Check mile requirements
-        mile_matches = re.findall(r'(\d+)\s*miles?', remark)
+        mile_matches = re.findall(r'(\d+)\s*miles?', criteria)
         if mile_matches:
             required_miles = int(mile_matches[0])
+            print(f"required miles: {required_miles}")
+            print(f"mileage: {mileage}")
+            print(f"{type(mileage)},{type(required_miles)}")
             if mileage >= required_miles:
                 # Fully met requirement
-                keep_task = True
-                include_as_default = True
+                is_mandatory = True
             elif mileage >= (required_miles * 0.7):
                 # 70%+ met but not fully
-                keep_task = True
-                include_as_default = False
+                is_mandatory = False
         
         # If no time/mileage requirements found in remark, keep the task with default behavior
         if not month_matches and not mile_matches:
-            keep_task = True
-            include_as_default = task.get("includeByDefault", False)
+            is_mandatory = task.get("isMandatory", False)
         
-        if keep_task:
-            # Update the task with the calculated includeByDefault value
+        if is_mandatory:
+            # Update the task with the calculated isMandatory value
             task_copy = task.copy()
-            task_copy["includeByDefault"] = include_as_default
+            task_copy["isMandatory"] = is_mandatory
             filtered_tasks.append(task_copy)
+        else:
+            filtered_tasks.append(task)
     
     # Return the filtered maintenance tasks structure
     result = maintenance_tasks.copy()
-    result["subTasks"] = filtered_tasks
+    result["optionalTasks"] = filtered_tasks
     return result
-
-@app.post("/haynes-pro-v2")
-def haynes_pro_v2(job_data: HaynesProJobData):
-    try:
-        results_list = []
-        auth_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getAuthenticationVrid?distributorUsername={HAYNES_PRO_USERNAME}&distributorPassword={HAYNES_PRO_PASSWORD}&username=jnpda2025"
-        #log_api_call("haynes-pro-v2", job_data.tenant, job_data.vin, auth_url)
-        response = requests.get(auth_url)
-        if response.json()["statusCode"] == 0:
-            vrid = response.json()["vrid"]
-        else:
-            print(response.text)
-            exit()
-            
-        vin_decode_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/decodeVINV4?vrid={vrid}&vin={job_data.vin}&descriptionLanguage=en"
-        #log_api_call("haynes-pro-v2", job_data.tenant, job_data.vin, vin_decode_url)
-        vin_decode_response = requests.get(vin_decode_url)
-        if vin_decode_response.status_code != 200:
-            print(f"Haynes Pro VIN decoding failed: {vin_decode_response.text}")
-            return {"error": "Haynes Pro VIN decoding failed", "details": vin_decode_response.text}
-        vehicle_info_list = vin_decode_response.json()
-        if not vehicle_info_list or not isinstance(vehicle_info_list, list) or not vehicle_info_list[0].get("id"):
-            print(f"Invalid vehicle info from VIN decode: {vehicle_info_list}")
-            return {"error": "Invalid vehicle info from Haynes Pro", "details": vehicle_info_list}
-        car_type_id = vehicle_info_list[0]["id"]
-        #print(vehicle_info_list[0]["subjects"])
-        print(f"car type id: {car_type_id}")
-            
-        if "full service" in job_data.workItems[0].title.lower():
-            maintenance_system_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getMaintenanceSystemsV7?vrid={vrid}&descriptionLanguage=en&carTypeId={car_type_id}&typeCategory=CAR&countryCodes=gb&useImperial=true&includeServiceTimes=true"
-            response = requests.get(maintenance_system_url)
-            maintenance_systems = response.json()
-            system_id = maintenance_systems[0]["id"]
-            maintenance_periods = {period["id"]:period["name"] for period in maintenance_systems[0]["maintenancePeriods"]}
-            print(f"maintenance systems: {maintenance_systems}")
-            client = genai.Client(api_key=GEMINI_API_KEY)
-
-            days_since_last_service = (datetime.now() - datetime.strptime(job_data.last_service_date, "%Y-%m-%d")).days
-            
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=f"given the following maintenance periods: {maintenance_periods}, and given the vehicle has {job_data.mileage} miles and its last service was {days_since_last_service} days ago, return the most appropriate maintenance period. Return only the id and name of the maintenance period in a json format.",
-            )
-            print(response.text)
-            import json
-            maintenance_period_id = response.text.split("```json")[1].split("```")[0]
-            json_response = json.loads(maintenance_period_id)
-            period_name = json_response['name']
-            print(f"maintenance period id: {json_response}")
-            
-            maintenance_tasks_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getMaintenanceTasksV9?vrid={vrid}&descriptionLanguage=en&carTypeId={car_type_id}&systemId={system_id}&periodId={json_response['id']}&includeSmartLinks=false&includeServiceTimes=true"
-            #log_api_call("haynes-pro-v2", job_data.tenant, job_data.vin, maintenance_tasks_url)
-            response = requests.get(maintenance_tasks_url)
-            maintenance_tasks = response.json()
-            maintenance_tasks = check_maintenance_period(maintenance_tasks, days_since_last_service, job_data.mileage)
-            #print(f"maintenance tasks: {maintenance_tasks}")
-            results_list.append({"car_type_id": car_type_id, "system_id": system_id, "period_id": json_response['id'], "maintenance_tasks": maintenance_tasks, "period_name": json_response['name']})
-            return {
-            "results": results_list,
-            "tree_structure": {},
-            "matched_work_items": {}
-        }
-        else:
-            print("No full service in job data")
-            return repair_tasks(job_data, vrid, car_type_id)
-            exit()
-    except Exception as e:
-        print(e)
-        print(traceback.format_exc())
-        return {"title":"error"}
-    return {"title":"success"}
-
     
 
-@app.post("/repair-instructions")
-def repair_instructions(job_data: RepairInstructionsJobData):
-    try:
-        auth_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getAuthenticationVrid?distributorUsername={HAYNES_PRO_USERNAME}&distributorPassword={HAYNES_PRO_PASSWORD}&username=jnpda2025"
-        log_api_call("repair-instructions", job_data.tenant, job_data.vin, auth_url)
-        response = requests.get(auth_url)
-        if response.json()["statusCode"] == 0:
-            vrid = response.json()["vrid"]
-        else:
-            print(response.text)
-            exit()
-        
-        results_list = []
-        for repair_task_id in job_data.repairTaskIds:
-            repair_infos_url = f"https://www.haynespro-services.com/workshopServices3/rest/jsonendpoint/getRepairtimeInfosV4?vrid={vrid}&descriptionLanguage=en&repairtimeTypeId={job_data.target_repairtime_type_id}&typeCategory={job_data.type_category}&repairTaskId={repair_task_id}"
-            log_api_call("repair-instructions", job_data.tenant, job_data.vin, repair_infos_url)
-            response = requests.get(repair_infos_url)
-            repairtime_infos = response.json()
-            print(f"repairtime infos: {repairtime_infos}")
-            results_list.append({"repair_task_id": repair_task_id, "repairtime_infos": repairtime_infos})
-    except Exception as e:
-        print(e)
-        print(traceback.format_exc())
-        return {"title":"error"}
-    return {
-        "results": results_list,
-        "tree_structure": tree_structure,
-        "matched_work_items": matched_work_items
-    }
-
-
-def get_supported_brands(input_brand):
-    supported_brands = {"brands":["Alpine","Audi","Bentley","BMW","BMWMotorrad","Seat","Dacia","Jaguar","LandRover","Mercedes","MercedesTrucks","MercedesUnimog","MercedesVans","Mini","Mitsubishi","MAN","Porsche","PorscheClassic","Renault","Seat","Skoda","Smart","VW","VWCommercial","Toyota","Lexus","Suzuki"]}
-    brands_list = supported_brands.get("brands", [])
-    for brand in brands_list:
-        if input_brand.lower() == brand.lower():
-            return brand
-        elif input_brand.lower() == "vw" or input_brand.lower() == "volkswagen":
-            return "VW"
-    return None
-
-@app.post("/partslink24")
-def partslink24(job_data: PartsLink24JobData):
-    brand = get_supported_brands(job_data.brand)
-    if brand is None:
-        return {"title":"error", "message":"Brand not supported"}
-    
-    
-    BASE_URL = "https://demo.partslink24.com/pl24-orderbrg/ext/"
-
-    # Authentication (Basic Auth)
-    USERNAME = "orderbridge-combine-gb"
-    PASSWORD = "jcL2(733dt"
-    AUTH = (USERNAME, PASSWORD)
-    
-    order_submission_url = f"{BASE_URL}api/1.0/order-submissions"
-    headers = {
-        "Accept-Language": "EN",
-        "Content-Type": "application/xml" # Explicitly set Content-Type for XML
-    }
-    
-    print(f"--- EXT order-submissions {job_data.brand}  ---")
-    part_items = ""
-    externalID = 1
-    for part in job_data.workItems:
-        # Check if part has partnumbers list and handle accordingly
-        if hasattr(part, 'part_numbers') and part.part_numbers:
-            # Create a partItem for each part number
-            for part_number in part.part_numbers:
-                part_items += f"""  <partItem externalID="{externalID}" activity="rep{externalID}">
-            <description>{part.invoice_description[:20]}</description>
-            <partNumber>{part_number}</partNumber>
-            <quantity>1</quantity>
-        </partItem>"""
-                externalID += 1
-        else:
-            # If no part numbers or empty list, use "unknown"
-            part_items += f"""<partItem externalID="{externalID}" activity="rep{externalID}">
-            <description>{part.invoice_description[:20]}</description>
-            <partNumber>unknown</partNumber>
-            <quantity>1</quantity>
-        </partItem>\n"""
-            externalID += 1
-        
-    xml_body_order_submission = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    <orderSubmission externalID="Reparatur001">
-        <externalSystem>
-            <user>Extern User</user>
-            <name>combine systems</name>
-            <country>GB</country>
-            <language>en</language>
-            <tenant>Test Dealership</tenant>
-        </externalSystem>
-        <history>
-        </history>
-        <orderData>
-            <brand>{brand}</brand>
-            <vin>{job_data.vin}</vin>
-            <partItems>
-                {part_items}
-            </partItems>
-            <labourItems>
-            </labourItems>
-            <paintItems>
-            </paintItems>    </orderData>
-    </orderSubmission>"""
-    print(xml_body_order_submission)
-    try:
-        log_api_call("partslink24", job_data.tenant, job_data.vin, order_submission_url, "POST")
-        response = requests.post(order_submission_url, headers=headers, data=xml_body_order_submission, auth=AUTH)
-        response.raise_for_status()
-        print(f"Status Code: {response.status_code}")
-        print(f"Response Body: {response.text}")
-    except requests.exceptions.RequestException as e:
-        print(f"Error: {e}")
-    print("\n")
-    
-    import xml.etree.ElementTree as ET
-
-    # Parse the XML string
-    root = ET.fromstring(response.text)
-
-    # Find the accessToken element and get its text
-    access_token = root.find('accessToken').text
-
-    print(f"Access Token: {access_token}")
-    
-    # EXT entry-points
-    print("--- EXT entry-points ---")
-    entry_points_url = f"{BASE_URL}api/1.0/entry-points/{access_token}"
-    headers_json = {
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
-    try:
-        log_api_call("partslink24", job_data.tenant, job_data.vin, entry_points_url)
-        response = requests.get(entry_points_url, headers=headers_json, auth=AUTH)
-        response.raise_for_status()
-        print(f"Status Code: {response.status_code}")
-        print(f"Response Body (JSON): {response.json()}")
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error: {e}")
-    print("\n")
-    
-    return {"title":"success"}
-
-    
     
 @app.get("/")
 def read_root():

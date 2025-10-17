@@ -7,9 +7,18 @@ class WorkItem(BaseModel):
     invoice_description: str
     parts_numbers: List[str]
     
+class SupplierDetails(BaseModel):
+    supplierId: int 
+    
+class PartsQuoteJobData(BaseModel):
+    vrm: str
+    genart: int
+    suppliers: List[SupplierDetails]
+    
 class CreateTreeJobData(BaseModel):
-    vin: str
+    vrm: str
     tenant: str
+    
   
 class NodeSearchJobData(BaseModel):
     vrid: str
@@ -23,13 +32,15 @@ class JobData(BaseModel):
     engine: str
     make: str
     model: str
-    vin: str
+    vrm: str
     workItems: List[WorkItem]
     year: str
     tenant: str
     
 class HaynesProJobData(BaseModel):
-    vin: str
+    vrm: str
+    fuel: str
+    manufacture_date: str
     workItems: List[WorkItem]
     tenant: str
     mileage: str

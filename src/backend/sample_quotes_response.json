@@ -1,0 +1,50 @@
+{ 
+  "parts": [ 
+    { 
+      "supplierId": 1, 
+      "supplierCode": "ECP", 
+      "partNumber": "104590266", 
+      "brand": "TEXTAR", 
+      "description": "FRONT DISC FOCUS/C-MAX & VOLVO V50 (03-) 300mm (V)", 
+      "image": 
+"http://images.lteplatform.com/images/products/600x600/104590266.jpg", 
+      "price": "30.77", 
+      "retailPrice": "48.32", 
+      "eta": null, 
+      "location": "No Stock", 
+      "supplierQuoteId": null, 
+      "quantityAvailable": 0, 
+      "quality": "Premium", 
+      "quantityOfFit": 2, 
+      "partPermission": "", 
+      "hasIncorrectFittingPosition": false, 
+      "fittingPositions": [ 
+        { 
+          "positionType": "FrontRear", 
+          "position": "front" 
+        } 
+      ], 
+      "partProperties": { 
+        "Fitting Position": "Front", 
+        "Brake Disc Type": "Vented", 
+        "Disc Ø mm": "300", 
+        "Position": "front", 
+        "Part:Bolt Hole Circle mm": "108", 
+        "Part:Brake Disc Thickness mm": "25", 
+        "Part:Brake Disc Type": "Vented", 
+        "Part:Centering Diameter mm": "64", 
+        "Part:Disc Ø mm": "300", 
+        "Part:Fitted Quantity": "2", 
+        "Part:Genart": "00082", 
+        "Part:Height mm": "49", 
+        "Part:MasterRef": "514317", 
+        "Part:Minimum Thickness mm": "23", 
+        "Part:No.Holes": "5", 
+        "Part:Old Component Number": "000027", 
+        "IsMultiFit": "false" 
+      }, 
+      "supplierProperties": {} 
+    } 
+  ], 
+  "partSystems": [] 
+}
