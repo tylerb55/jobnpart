@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 import uvicorn
@@ -24,9 +24,18 @@ from threading import Timer
 import aiohttp
 import pickle
 import tempfile
+import sys
 
 load_dotenv()
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 logger = logging.getLogger(__name__)
 
 API_KEY = os.getenv("PARTS_CATALOG_API_KEY")
@@ -68,63 +77,138 @@ def unpickle_object(filename):
     print(f"Successfully unpickled object from '{filename}'.")
     return obj
 
-def upload_to_supabase(file_path):
-    if file_path.endswith(".json"):
-        mime_type = "application/json"
-    elif file_path.endswith(".pkl"):
-        mime_type = "application/octet-stream"
-    elif file_path.endswith(".ann"):
-        mime_type = "text/plain"
-    else:
-        print(f"Unsupported file type: {file_path}")
-        return None
+def upload_to_supabase(file_path: str) -> bool:
+    """
+    Upload a file to Supabase storage.
+    
+    Args:
+        file_path: Path to the file to upload
+        
+    Returns:
+        True if successful, False otherwise
+        
+    Raises:
+        ValueError: If file type is not supported
+        RuntimeError: If upload fails
+    """
+    # Determine MIME type based on file extension
+    mime_type_map = {
+        ".json": "application/json",
+        ".pkl": "application/octet-stream",
+        ".ann": "application/octet-stream"
+    }
+    
+    file_ext = os.path.splitext(file_path)[1]
+    mime_type = mime_type_map.get(file_ext)
+    
+    if not mime_type:
+        error_msg = f"Unsupported file type: {file_path}"
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+    
     try:
+        # Determine storage path based on file extension
+        storage_folder = file_ext.lstrip(".")
+        storage_path = f"{storage_folder}/{file_path}"
+        
         with open(file_path, "rb") as f:
             response = supabase.storage.from_("repair_tasks").upload(
                 file=f,
-                path=file_path.split(".")[-1] + "/" + file_path,
-                # Set a file_options for pickle files. The MIME type is usually 'application/octet-stream' for generic binary files.
-                file_options={"content-type": mime_type, "cache-control": "3600", "upsert": "true",}
+                path=storage_path,
+                file_options={
+                    "content-type": mime_type, 
+                    "cache-control": "3600", 
+                    "upsert": "true"
+                }
             )
-        print(f"{file_path} uploaded successfully!")
+        
+        logger.info(f"Successfully uploaded {file_path} to Supabase at {storage_path}")
+        return True
+        
+    except FileNotFoundError as e:
+        logger.error(f"File not found for upload: {file_path}")
+        raise RuntimeError(f"Cannot upload non-existent file: {file_path}") from e
+        
     except Exception as e:
-        print(f"Error uploading file: {e}")
-        return None
+        logger.error(f"Error uploading file {file_path} to Supabase: {e}")
+        logger.error(traceback.format_exc())
+        raise RuntimeError(f"Failed to upload {file_path}: {str(e)}") from e
     
 def download_from_supabase(vrm: str):
+    """
+    Download and load cached repair tree data from Supabase storage.
+    
+    Args:
+        vrm: Vehicle Registration Mark
+        
+    Returns:
+        Tuple of (full_repair_tree, annoy_index, bm25) if successful
+        
+    Raises:
+        FileNotFoundError: If the VRM data is not found in Supabase
+        RuntimeError: If download or loading fails for other reasons
+    """
     global REPAIR_TASKS, REPAIR_DESCRIPTIONS, annoy_index, bm25, full_repair_tree
+    
+    temp_files = []
+    
     try:
-        # Attempt to download the file bytes
-        json_repair_tree = supabase.storage.from_("repair_tasks").download(f"json/{vrm}_repair_tree.json")
-        with open(f"{vrm}_repair_tree.json", "rb") as f:
+        logger.info(f"Downloading repair tree data for VRM: {vrm} from Supabase")
+        
+        # Download repair tree
+        tree_file = f"{vrm}_repair_tree.json"
+        supabase.storage.from_("repair_tasks").download(f"json/{tree_file}")
+        temp_files.append(tree_file)
+        with open(tree_file, "r") as f:
             full_repair_tree = json.load(f)
-        os.remove(f"{vrm}_repair_tree.json")
-        json_repair_tasks = supabase.storage.from_("repair_tasks").download(f"json/{vrm}_repair_tasks.json")
-        with open(f"{vrm}_repair_tasks.json", "rb") as f:
+        
+        # Download repair tasks
+        tasks_file = f"{vrm}_repair_tasks.json"
+        supabase.storage.from_("repair_tasks").download(f"json/{tasks_file}")
+        temp_files.append(tasks_file)
+        with open(tasks_file, "r") as f:
             json_repair_tasks = json.load(f)
-        os.remove(f"{vrm}_repair_tasks.json")
         REPAIR_TASKS = json_repair_tasks["tasks"]
         REPAIR_DESCRIPTIONS = json_repair_tasks["descriptions"]
-        print(f"Json repair tasks: {json_repair_tasks}")
-        annoy_index_bytes = supabase.storage.from_("repair_tasks").download(f"ann/{vrm}_annoy_index.ann")
+        
+        # Download Annoy index
+        annoy_file = f"{vrm}_annoy_index.ann"
+        supabase.storage.from_("repair_tasks").download(f"ann/{annoy_file}")
+        temp_files.append(annoy_file)
         annoy_index = AnnoyIndex(VECTOR_DIMENSION, METRIC)
-        annoy_index.load(f"{vrm}_annoy_index.ann")
-        os.remove(f"{vrm}_annoy_index.ann")
-        bm25 = supabase.storage.from_("repair_tasks").download(f"pkl/{vrm}_bm25.pkl")
-        with open(f"{vrm}_bm25.pkl", "rb") as f:
+        annoy_index.load(annoy_file)
+        
+        # Download BM25 index
+        bm25_file = f"{vrm}_bm25.pkl"
+        supabase.storage.from_("repair_tasks").download(f"pkl/{bm25_file}")
+        temp_files.append(bm25_file)
+        with open(bm25_file, "rb") as f:
             bm25 = pickle.load(f)
-        os.remove(f"{vrm}_bm25.pkl")
+        
+        logger.info(f"Successfully loaded cached data for VRM: {vrm}")
         return full_repair_tree, annoy_index, bm25
+        
     except Exception as e:
-        # The Supabase Storage API returns a 404 (Not Found) for a missing file.
-        # The Python client translates this into a StorageException.
-        if "The resource was not found" in str(e) or "404" in str(e):
-            print(f"❌ Object not found at '{path}'.")
-            return False, None
-        else:
-            # Handle other errors (e.g., RLS policy, connection issue)
-            print(f"⚠️ An unexpected error occurred: {e}")
-            return False, None
+        error_msg = str(e)
+        
+        # Check if it's a 404/not found error
+        if "not found" in error_msg.lower() or "404" in error_msg:
+            logger.info(f"No cached data found for VRM: {vrm}")
+            raise FileNotFoundError(f"No cached repair tree found for VRM: {vrm}") from e
+        
+        # Other errors
+        logger.error(f"Error downloading data from Supabase for VRM {vrm}: {e}")
+        logger.error(traceback.format_exc())
+        raise RuntimeError(f"Failed to download repair tree from Supabase: {error_msg}") from e
+        
+    finally:
+        # Clean up temporary files
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temp file {temp_file}: {e}")
     
 def log_haynes_pro_request(tenant_code: str,
     service: str,
@@ -374,103 +458,325 @@ def search_annoy_index(query_text, annoy_index, model, top_k=2):
         
     return results
 
+def _build_search_indexes(vrm: str, repair_descriptions: List[str]) -> tuple[BM25Okapi, AnnoyIndex]:
+    """
+    Build BM25 and Annoy search indexes from repair descriptions.
+    
+    Args:
+        vrm: Vehicle Registration Mark
+        repair_descriptions: List of repair task descriptions
+        
+    Returns:
+        Tuple of (bm25_index, annoy_index)
+        
+    Raises:
+        ValueError: If descriptions are empty or invalid
+        RuntimeError: If index building fails
+    """
+    if not repair_descriptions:
+        raise ValueError("Cannot build indexes with empty descriptions")
+    
+    try:
+        # Build BM25 index with robust tokenization
+        tokenized_descriptions = []
+        for desc in repair_descriptions:
+            parts = desc.split(" -> ")
+            if len(parts) >= 2:
+                tokenized_descriptions.append(tokenize(parts[-2]))
+            else:
+                tokenized_descriptions.append(tokenize(parts[-1] if parts else ""))
+        
+        bm25_index = BM25Okapi(tokenized_descriptions)
+        logger.info(f"Built BM25 index with {len(tokenized_descriptions)} descriptions")
+        
+        # Build Annoy index
+        vectors = model.encode(repair_descriptions)
+        annoy_idx = AnnoyIndex(VECTOR_DIMENSION, METRIC)
+        
+        for i, vector in enumerate(vectors):
+            annoy_idx.add_item(i, vector)
+        
+        annoy_idx.build(NUM_TREES)
+        logger.info(f"Built Annoy index with {len(vectors)} vectors")
+        
+        return bm25_index, annoy_idx
+        
+    except Exception as e:
+        logger.error(f"Failed to build search indexes: {e}")
+        logger.error(traceback.format_exc())
+        raise RuntimeError(f"Index building failed: {str(e)}") from e
+
+
+def _save_repair_tree_artifacts(vrm: str, root_node_structure: dict, 
+                                repair_tasks: List[dict], repair_descriptions: List[str],
+                                bm25_index: BM25Okapi, annoy_idx: AnnoyIndex) -> List[str]:
+    """
+    Save all repair tree artifacts to files and upload to Supabase.
+    
+    Args:
+        vrm: Vehicle Registration Mark
+        root_node_structure: The complete repair tree structure
+        repair_tasks: List of repair tasks
+        repair_descriptions: List of repair descriptions
+        bm25_index: BM25 search index
+        annoy_idx: Annoy search index
+        
+    Returns:
+        List of created file paths for cleanup
+        
+    Raises:
+        IOError: If file operations fail
+    """
+    created_files = []
+    
+    try:
+        # Save repair tasks
+        tasks_file = f"{vrm}_repair_tasks.json"
+        with open(tasks_file, "w") as f:
+            json.dump({"tasks": repair_tasks, "descriptions": repair_descriptions}, f)
+        created_files.append(tasks_file)
+        upload_to_supabase(tasks_file)
+        
+        # Save Annoy index
+        annoy_file = f"{vrm}_annoy_index.ann"
+        annoy_idx.save(annoy_file)
+        created_files.append(annoy_file)
+        upload_to_supabase(annoy_file)
+        
+        # Save BM25 index
+        bm25_file = f"{vrm}_bm25.pkl"
+        pickle_object(bm25_index, bm25_file)
+        created_files.append(bm25_file)
+        upload_to_supabase(bm25_file)
+        
+        # Save repair tree
+        tree_file = f"{vrm}_repair_tree.json"
+        with open(tree_file, "w") as f:
+            json.dump(root_node_structure, f)
+        created_files.append(tree_file)
+        upload_to_supabase(tree_file)
+        
+        logger.info(f"Successfully saved all artifacts for VRM: {vrm}")
+        return created_files
+        
+    except Exception as e:
+        logger.error(f"Failed to save artifacts: {e}")
+        logger.error(traceback.format_exc())
+        raise IOError(f"Failed to save repair tree artifacts: {str(e)}") from e
+
+
+def _cleanup_temp_files(file_paths: List[str]) -> None:
+    """Remove temporary files, logging any failures."""
+    for file_path in file_paths:
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.debug(f"Cleaned up temp file: {file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup temp file {file_path}: {e}")
+
+
+def _validate_repair_descriptions(repair_tasks: List[dict], repair_descriptions: List[str]) -> None:
+    """Log warnings for descriptions that don't follow expected format."""
+    logger.info(f"Validating {len(repair_descriptions)} repair descriptions")
+    
+    for idx, desc in enumerate(repair_descriptions):
+        parts = desc.split(" -> ")
+        if len(parts) < 2:
+            logger.warning(
+                f"Description at index {idx} has only {len(parts)} part(s): "
+                f"'{desc}' (awNumber: {repair_tasks[idx]['awNumber']})"
+            )
+
+
 @app.post("/create-tree-async")
 async def build_full_repair_tree(data: CreateTreeJobData) -> dict:
     """
     Recursively traverse all subnodes starting from root and return the entire tree structure.
     Uses async/await with parallel API calls for dramatic performance improvement.
+    
+    Workflow:
+    1. Attempt to load cached tree from Supabase
+    2. If not found, build tree from scratch via API calls
+    3. Create search indexes (BM25 and Annoy)
+    4. Save artifacts to Supabase
+    
+    Args:
+        data: CreateTreeJobData containing vrm and tenant information
+        
+    Returns:
+        Complete repair tree structure as dictionary
+        
+    Raises:
+        HTTPException: 400 for validation errors, 500 for server errors
     """
-    global api_call_count
-    global REPAIR_TASKS
-    global REPAIR_DESCRIPTIONS
-    global bm25
-    global annoy_index
-    api_call_count = 0 # Reset counter for a fresh call
+    global api_call_count, REPAIR_TASKS, REPAIR_DESCRIPTIONS, bm25, annoy_index, full_repair_tree
+    
+    api_call_count = 0
+    temp_files = []
     
     try:
-        full_repair_tree, annoy_index, bm25 = download_from_supabase(data.vrm)
-        root_node_structure = full_repair_tree
-        return root_node_structure
-    except Exception as e:
-        print(f"VRM not found in database: {e}")
-        # Define the structure for the root node
+        # Validate input
+        if not data.vrm or not data.vrm.strip():
+            raise HTTPException(status_code=400, detail="VRM is required")
+        
+        logger.info(f"Building repair tree for VRM: {data.vrm}")
+        
+        # Attempt to load from cache
+        try:
+            logger.info(f"Attempting to load cached tree for VRM: {data.vrm}")
+            cached_tree, cached_annoy, cached_bm25 = download_from_supabase(data.vrm)
+            
+            if cached_tree:
+                full_repair_tree = cached_tree
+                annoy_index = cached_annoy
+                bm25 = cached_bm25
+                logger.info(f"Successfully loaded cached tree for VRM: {data.vrm}")
+                return cached_tree
+                
+        except Exception as e:
+            logger.info(f"Cache miss for VRM {data.vrm}, building from scratch: {e}")
+        
+        # Build tree from scratch
+        logger.info(f"Building repair tree from API for VRM: {data.vrm}")
+        
         root_node_structure = {
-            "awNumber": "root", # The ID of the root itself
-            "description": "Root Node", # Placeholder description for the initial ID
+            "awNumber": "root",
+            "description": "Root Node",
             "parentNodeId": None,
             "childTasks": []
         }
-
-        # Use aiohttp session for connection pooling`1  `
-        async with aiohttp.ClientSession() as session:
-            root_node_structure["childTasks"] = await _dfs_async("root", "", data.vrm, data.tenant, session)
-    
+        
+        # Fetch tree structure via async API calls
+        try:
+            async with aiohttp.ClientSession() as session:
+                root_node_structure["childTasks"] = await _dfs_async(
+                    "root", "", data.vrm, data.tenant, session
+                )
+        except Exception as e:
+            logger.error(f"Failed to fetch repair tree from API: {e}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to fetch repair tree from external API: {str(e)}"
+            ) from e
+        
+        # Extract and validate tasks
+        try:
+            REPAIR_TASKS = extract_tasks_dfs(root_node_structure.get("childTasks", []))
+            REPAIR_DESCRIPTIONS = [task["description"] for task in REPAIR_TASKS]
             
-        REPAIR_TASKS = extract_tasks_dfs(root_node_structure.get("childTasks"))
-        REPAIR_DESCRIPTIONS = [task["description"] for task in REPAIR_TASKS]
-        with open(f"{data.vrm}_repair_tasks.json", "w") as f:
-            json.dump({"tasks": REPAIR_TASKS, "descriptions": REPAIR_DESCRIPTIONS}, f)
-        upload_to_supabase(f"{data.vrm}_repair_tasks.json")
+            if not REPAIR_TASKS:
+                logger.warning(f"No repair tasks found for VRM: {data.vrm}")
+                return root_node_structure
+            
+            _validate_repair_descriptions(REPAIR_TASKS, REPAIR_DESCRIPTIONS)
+            
+        except Exception as e:
+            logger.error(f"Failed to extract repair tasks: {e}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to process repair tasks: {str(e)}"
+            ) from e
         
-        # Debug: Check which descriptions don't have enough elements
-        print(f"Total descriptions: {len(REPAIR_DESCRIPTIONS)}")
-        for idx, desc in enumerate(REPAIR_DESCRIPTIONS):
-            parts = desc.split(" -> ")
-            if len(parts) < 2:
-                print(f"WARNING - Description at index {idx} has only {len(parts)} part(s):")
-                print(f"  Description: '{desc}'")
-                print(f"  Task awNumber: {REPAIR_TASKS[idx]['awNumber']}")
+        # Build search indexes
+        try:
+            bm25, annoy_index = _build_search_indexes(data.vrm, REPAIR_DESCRIPTIONS)
+        except Exception as e:
+            logger.error(f"Failed to build search indexes: {e}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to build search indexes: {str(e)}"
+            ) from e
         
-        # Robust tokenization: use second-to-last element if available, otherwise use the last element
-        tokenized_descriptions = []
-        for desc in REPAIR_DESCRIPTIONS:
-            parts = desc.split(" -> ")
-            if len(parts) >= 2:
-                tokenized_descriptions.append(tokenize(parts[-2]))
-            else:
-                # Fallback: use the entire description or last part
-                tokenized_descriptions.append(tokenize(parts[-1] if parts else ""))
-        bm25 = BM25Okapi(tokenized_descriptions)
-        vectors = model.encode(REPAIR_DESCRIPTIONS)
-        annoy_index = AnnoyIndex(VECTOR_DIMENSION, METRIC)
-
-        for i, vector in enumerate(vectors):
-            annoy_index.add_item(i, vector)
-
-        annoy_index.build(NUM_TREES)
-        annoy_index.save(f"{data.vrm}_annoy_index.ann")
+        # Save artifacts
+        try:
+            temp_files = _save_repair_tree_artifacts(
+                data.vrm, root_node_structure, REPAIR_TASKS, 
+                REPAIR_DESCRIPTIONS, bm25, annoy_index
+            )
+        except Exception as e:
+            logger.error(f"Failed to save artifacts: {e}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to save repair tree artifacts: {str(e)}"
+            ) from e
         
-        pickle_object(bm25, f"{data.vrm}_bm25.pkl")
-        
-        upload_to_supabase(f"{data.vrm}_annoy_index.ann")
-        upload_to_supabase(f"{data.vrm}_bm25.pkl")
         full_repair_tree = root_node_structure
-        
-        with open(f"{data.vrm}_repair_tree.json", "w") as f:
-            json.dump(root_node_structure, f)
-        upload_to_supabase(f"{data.vrm}_repair_tree.json")
-        
-        # Add the API call count to the final structure
-        #root_node_structure["api_call_count"] = api_call_count
+        logger.info(f"Successfully built and saved repair tree for VRM: {data.vrm}")
         
         return root_node_structure
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+        
+    except Exception as e:
+        # Catch any unexpected errors
+        logger.error(f"Unexpected error in build_full_repair_tree: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"An unexpected error occurred: {str(e)}"
+        ) from e
+        
+    finally:
+        # Clean up temporary files
+        if temp_files:
+            _cleanup_temp_files(temp_files)
 
 
 async def _fetch_repair_subnodes_async(vrm: str, awnumber: str, tenant: str, session: aiohttp.ClientSession) -> list:
     """
     Async version: Fetch one level of subnodes for a given nodeId.
+    
+    Args:
+        vrm: Vehicle Registration Mark
+        awnumber: AW number of the node to fetch subnodes for
+        tenant: Tenant identifier
+        session: Aiohttp session for connection pooling
+        
+    Returns:
+        List of subnodes, or empty list if fetch fails
     """
     global api_call_count
     api_call_count += 1
     
     subnodes_url = f"https://apiuat.haynesquoteengine.co.uk/api/v1/RepairTree/{vrm}/Layer/{awnumber}"
-    log_haynes_pro_request(tenant, "Repair Tree Subnodes (Building repair tree)", vrm, f"{DOMAIN}", subnodes_url, datetime.now().isoformat())
+    log_haynes_pro_request(
+        tenant, 
+        "Repair Tree Subnodes (Building repair tree)", 
+        vrm, 
+        f"{DOMAIN}", 
+        subnodes_url, 
+        datetime.now().isoformat()
+    )
     
     try:
-        async with session.get(subnodes_url, headers=GLOBAL_HEADERS) as response:
+        async with session.get(subnodes_url, headers=GLOBAL_HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            response.raise_for_status()
             return await response.json()
+            
+    except aiohttp.ClientResponseError as e:
+        logger.error(f"HTTP error fetching subnodes for {awnumber}: {e.status} - {e.message}")
+        logger.error(traceback.format_exc())
+        return []
+        
+    except aiohttp.ClientError as e:
+        logger.error(f"Network error fetching subnodes for {awnumber}: {e}")
+        logger.error(traceback.format_exc())
+        return []
+        
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout fetching subnodes for {awnumber}")
+        return []
+        
     except Exception as e:
-        print(f"Error fetching subnodes for {awnumber}: {e}")
+        logger.error(f"Unexpected error fetching subnodes for {awnumber}: {e}")
+        logger.error(traceback.format_exc())
         return []
 
 async def _dfs_async(node_id: str, path: str, vrm: str, tenant: str, session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
