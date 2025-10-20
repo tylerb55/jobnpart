@@ -52,6 +52,13 @@ VECTOR_DIMENSION = 768
 METRIC = 'angular' # Common metric for semantic similarity (cosine similarity)
 NUM_TREES = 10     # Higher number of trees gives better precision but slower indexing
 
+# API Request Configuration
+MAX_CONCURRENT_CONNECTIONS = 20  # Maximum total concurrent connections
+MAX_CONNECTIONS_PER_HOST = 10    # Maximum concurrent connections per host
+REQUEST_TIMEOUT_SECONDS = 90     # Timeout for individual API requests
+MAX_RETRIES = 3                  # Maximum retry attempts for failed requests
+BATCH_SIZE = 50                  # Maximum concurrent DFS traversals
+
 
 # Initialize Supabase client with service role key (bypasses RLS for backend operations)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
@@ -649,7 +656,16 @@ async def build_full_repair_tree(data: CreateTreeJobData) -> dict:
         
         # Fetch tree structure via async API calls
         try:
-            async with aiohttp.ClientSession() as session:
+            # Configure session with connection limits to prevent overwhelming the server
+            connector = aiohttp.TCPConnector(
+                limit=MAX_CONCURRENT_CONNECTIONS,
+                limit_per_host=MAX_CONNECTIONS_PER_HOST,
+                ttl_dns_cache=300  # DNS cache TTL in seconds
+            )
+            
+            timeout = aiohttp.ClientTimeout(total=None)  # No total timeout for the session
+            
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 root_node_structure["childTasks"] = await _dfs_async(
                     "root", "", data.vrm, data.tenant, session
                 )
@@ -729,18 +745,27 @@ async def build_full_repair_tree(data: CreateTreeJobData) -> dict:
             _cleanup_temp_files(temp_files)
 
 
-async def _fetch_repair_subnodes_async(vrm: str, awnumber: str, tenant: str, session: aiohttp.ClientSession) -> list:
+async def _fetch_repair_subnodes_async(
+    vrm: str, 
+    awnumber: str, 
+    tenant: str, 
+    session: aiohttp.ClientSession,
+    max_retries: int = MAX_RETRIES,
+    timeout_seconds: int = REQUEST_TIMEOUT_SECONDS
+) -> list:
     """
-    Async version: Fetch one level of subnodes for a given nodeId.
+    Async version: Fetch one level of subnodes for a given nodeId with retry logic.
     
     Args:
         vrm: Vehicle Registration Mark
         awnumber: AW number of the node to fetch subnodes for
         tenant: Tenant identifier
         session: Aiohttp session for connection pooling
+        max_retries: Maximum number of retry attempts
+        timeout_seconds: Timeout in seconds for each request
         
     Returns:
-        List of subnodes, or empty list if fetch fails
+        List of subnodes, or empty list if fetch fails after all retries
     """
     global api_call_count
     api_call_count += 1
@@ -755,44 +780,96 @@ async def _fetch_repair_subnodes_async(vrm: str, awnumber: str, tenant: str, ses
         datetime.now().isoformat()
     )
     
-    try:
-        async with session.get(subnodes_url, headers=GLOBAL_HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as response:
-            response.raise_for_status()
-            return await response.json()
+    # Retry logic with exponential backoff
+    for attempt in range(max_retries):
+        try:
+            timeout = aiohttp.ClientTimeout(
+                total=timeout_seconds,
+                connect=10,  # 10 seconds to establish connection
+                sock_read=timeout_seconds - 10  # Remaining time for reading data
+            )
             
-    except aiohttp.ClientResponseError as e:
-        logger.error(f"HTTP error fetching subnodes for {awnumber}: {e.status} - {e.message}")
-        logger.error(traceback.format_exc())
-        return []
-        
-    except aiohttp.ClientError as e:
-        logger.error(f"Network error fetching subnodes for {awnumber}: {e}")
-        logger.error(traceback.format_exc())
-        return []
-        
-    except asyncio.TimeoutError:
-        logger.error(f"Timeout fetching subnodes for {awnumber}")
-        return []
-        
-    except Exception as e:
-        logger.error(f"Unexpected error fetching subnodes for {awnumber}: {e}")
-        logger.error(traceback.format_exc())
-        return []
+            async with session.get(subnodes_url, headers=GLOBAL_HEADERS, timeout=timeout) as response:
+                response.raise_for_status()
+                data = await response.json()
+                
+                # Log success if it took multiple attempts
+                if attempt > 0:
+                    logger.info(f"Successfully fetched subnodes for {awnumber} on attempt {attempt + 1}")
+                
+                return data
+                
+        except aiohttp.ClientResponseError as e:
+            if e.status == 429:  # Rate limit
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                logger.warning(f"Rate limited for {awnumber}, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                await asyncio.sleep(wait_time)
+                continue
+            elif e.status >= 500:  # Server error
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"Server error {e.status} for {awnumber}, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(wait_time)
+                    continue
+            
+            logger.error(f"HTTP error fetching subnodes for {awnumber}: {e.status} - {e.message}")
+            logger.error(traceback.format_exc())
+            return []
+            
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            error_type = "Timeout" if isinstance(e, asyncio.TimeoutError) else "Network error"
+            
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff
+                logger.warning(
+                    f"{error_type} fetching subnodes for {awnumber}, "
+                    f"retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})"
+                )
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"{error_type} fetching subnodes for {awnumber} after {max_retries} attempts: {e}")
+                logger.error(traceback.format_exc())
+                return []
+                
+        except Exception as e:
+            logger.error(f"Unexpected error fetching subnodes for {awnumber}: {e}")
+            logger.error(traceback.format_exc())
+            return []
+    
+    # If we exhausted all retries
+    logger.error(f"Failed to fetch subnodes for {awnumber} after {max_retries} attempts")
+    return []
 
-async def _dfs_async(node_id: str, path: str, vrm: str, tenant: str, session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+async def _dfs_async(
+    node_id: str, 
+    path: str, 
+    vrm: str, 
+    tenant: str, 
+    session: aiohttp.ClientSession,
+    semaphore: Optional[asyncio.Semaphore] = None,
+    batch_size: int = BATCH_SIZE
+) -> List[Dict[str, Any]]:
     """
     Async helper DFS function to recursively fetch and build the subtree for a given node_id.
-    Fetches all sibling nodes in parallel for dramatic performance improvement.
+    Fetches all sibling nodes in parallel with controlled concurrency.
     
     Args:
         node_id: The ID of the node whose direct children are to be fetched.
         path: The path taken to get to the current node.
         vrm: The VRM parameter for the API call.
+        tenant: Tenant identifier
         session: Aiohttp session for connection pooling.
+        semaphore: Optional semaphore to control concurrency (created if None)
+        batch_size: Maximum number of concurrent child fetches
 
     Returns:
         A list of dictionaries, where each dictionary is a child node with its full subtree.
     """
+    
+    # Create semaphore if not provided (at root level)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(batch_size)
     
     # 1. Fetch direct subnodes for the current node_id
     child_tasks_data = await _fetch_repair_subnodes_async(vrm, node_id, tenant, session)
@@ -818,18 +895,57 @@ async def _dfs_async(node_id: str, path: str, vrm: str, tenant: str, session: ai
         # 4. If this node has children, prepare an async task to fetch them in parallel
         if task["hasChildren"]:
             nodes_with_tasks.append(node)
-            async_tasks.append(_dfs_async(task["awNumber"], node["description"], vrm, tenant, session))
+            # Wrap the recursive call with semaphore to control concurrency
+            async_tasks.append(
+                _dfs_with_semaphore(
+                    task["awNumber"], node["description"], vrm, tenant, 
+                    session, semaphore, batch_size
+                )
+            )
     
-    # 5. Execute all child fetches in parallel
+    # 5. Execute all child fetches in parallel (controlled by semaphore)
     if async_tasks:
-        results = await asyncio.gather(*async_tasks)
+        results = await asyncio.gather(*async_tasks, return_exceptions=True)
         
         # 6. Assign results back to the corresponding nodes
         for node, child_result in zip(nodes_with_tasks, results):
-            node["childTasks"] = child_result
+            # Handle exceptions gracefully
+            if isinstance(child_result, Exception):
+                logger.error(f"Error fetching children for {node['awNumber']}: {child_result}")
+                node["childTasks"] = []
+            else:
+                node["childTasks"] = child_result
         
     # 7. Return the list of children for the current node_id
     return structured_children
+
+
+async def _dfs_with_semaphore(
+    node_id: str, 
+    path: str, 
+    vrm: str, 
+    tenant: str, 
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+    batch_size: int
+) -> List[Dict[str, Any]]:
+    """
+    Wrapper for _dfs_async that uses a semaphore to limit concurrency.
+    
+    Args:
+        node_id: The ID of the node whose direct children are to be fetched.
+        path: The path taken to get to the current node.
+        vrm: The VRM parameter for the API call.
+        tenant: Tenant identifier
+        session: Aiohttp session for connection pooling.
+        semaphore: Semaphore to control concurrency
+        batch_size: Maximum number of concurrent child fetches
+
+    Returns:
+        A list of dictionaries, where each dictionary is a child node with its full subtree.
+    """
+    async with semaphore:
+        return await _dfs_async(node_id, path, vrm, tenant, session, semaphore, batch_size)
 
 def extract_tasks_dfs(repair_tree_json):
     """
