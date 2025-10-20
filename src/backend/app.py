@@ -485,6 +485,7 @@ def _build_search_indexes(vrm: str, repair_descriptions: List[str]) -> tuple[BM2
     
     try:
         # Build BM25 index with robust tokenization
+        logger.info(f"Tokenizing {len(repair_descriptions)} descriptions for BM25...")
         tokenized_descriptions = []
         for desc in repair_descriptions:
             parts = desc.split(" -> ")
@@ -494,17 +495,34 @@ def _build_search_indexes(vrm: str, repair_descriptions: List[str]) -> tuple[BM2
                 tokenized_descriptions.append(tokenize(parts[-1] if parts else ""))
         
         bm25_index = BM25Okapi(tokenized_descriptions)
-        logger.info(f"Built BM25 index with {len(tokenized_descriptions)} descriptions")
+        logger.info(f"✓ Built BM25 index with {len(tokenized_descriptions)} descriptions")
         
         # Build Annoy index
-        vectors = model.encode(repair_descriptions)
+        logger.info(f"Encoding {len(repair_descriptions)} descriptions with sentence transformer...")
+        logger.info("This may take several minutes for large repair trees...")
+        
+        # Encode with optimized batch size and show progress
+        # Note: show_progress_bar is set to False to avoid tqdm output in production logs
+        vectors = model.encode(
+            repair_descriptions,
+            batch_size=32,  # Smaller batch size for better progress and lower memory
+            show_progress_bar=False,  # Disable tqdm in production
+            convert_to_numpy=True
+        )
+        
+        logger.info(f"✓ Encoded {len(vectors)} vectors, building Annoy index...")
+        
         annoy_idx = AnnoyIndex(VECTOR_DIMENSION, METRIC)
         
         for i, vector in enumerate(vectors):
             annoy_idx.add_item(i, vector)
+            # Log progress every 100 items
+            if (i + 1) % 100 == 0:
+                logger.info(f"  Added {i + 1}/{len(vectors)} vectors to index...")
         
+        logger.info(f"Building Annoy index tree structure (this may take a minute)...")
         annoy_idx.build(NUM_TREES)
-        logger.info(f"Built Annoy index with {len(vectors)} vectors")
+        logger.info(f"✓ Built Annoy index with {len(vectors)} vectors and {NUM_TREES} trees")
         
         return bm25_index, annoy_idx
         
