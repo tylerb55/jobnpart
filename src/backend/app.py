@@ -164,15 +164,19 @@ def download_from_supabase(vrm: str):
         
         # Download repair tree
         tree_file = f"{vrm}_repair_tree.json"
-        supabase.storage.from_("repair_tasks").download(f"json/{tree_file}")
+        tree_data = supabase.storage.from_("repair_tasks").download(f"json/{tree_file}")
         temp_files.append(tree_file)
+        with open(tree_file, "wb") as f:
+            f.write(tree_data)
         with open(tree_file, "r") as f:
             full_repair_tree = json.load(f)
         
         # Download repair tasks
         tasks_file = f"{vrm}_repair_tasks.json"
-        supabase.storage.from_("repair_tasks").download(f"json/{tasks_file}")
+        tasks_data = supabase.storage.from_("repair_tasks").download(f"json/{tasks_file}")
         temp_files.append(tasks_file)
+        with open(tasks_file, "wb") as f:
+            f.write(tasks_data)
         with open(tasks_file, "r") as f:
             json_repair_tasks = json.load(f)
         REPAIR_TASKS = json_repair_tasks["tasks"]
@@ -180,15 +184,19 @@ def download_from_supabase(vrm: str):
         
         # Download Annoy index
         annoy_file = f"{vrm}_annoy_index.ann"
-        supabase.storage.from_("repair_tasks").download(f"ann/{annoy_file}")
+        annoy_data = supabase.storage.from_("repair_tasks").download(f"ann/{annoy_file}")
         temp_files.append(annoy_file)
+        with open(annoy_file, "wb") as f:
+            f.write(annoy_data)
         annoy_index = AnnoyIndex(VECTOR_DIMENSION, METRIC)
         annoy_index.load(annoy_file)
         
         # Download BM25 index
         bm25_file = f"{vrm}_bm25.pkl"
-        supabase.storage.from_("repair_tasks").download(f"pkl/{bm25_file}")
+        bm25_data = supabase.storage.from_("repair_tasks").download(f"pkl/{bm25_file}")
         temp_files.append(bm25_file)
+        with open(bm25_file, "wb") as f:
+            f.write(bm25_data)
         with open(bm25_file, "rb") as f:
             bm25 = pickle.load(f)
         
@@ -505,8 +513,8 @@ def _build_search_indexes(vrm: str, repair_descriptions: List[str]) -> tuple[BM2
         # Note: show_progress_bar is set to False to avoid tqdm output in production logs
         vectors = model.encode(
             repair_descriptions,
-            batch_size=32,  # Smaller batch size for better progress and lower memory
-            show_progress_bar=False,  # Disable tqdm in production
+            batch_size=64,  # Smaller batch size for better progress and lower memory
+            show_progress_bar=True,  # Disable tqdm in production
             convert_to_numpy=True
         )
         
