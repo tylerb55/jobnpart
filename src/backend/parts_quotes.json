@@ -9,6 +9,14 @@
       }
     }
   ],
+  "placeholder": [
+    {
+      "part_name": "placeholder",
+      "urls": {
+        "placeholder": "https://craftsnippets.com/articles_images/placeholder/placeholder.jpg"
+      }
+    }
+  ],
   "n/a": [
     {
       "part_name": "brake pads",

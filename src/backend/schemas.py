@@ -11,12 +11,19 @@ class SupplierDetails(BaseModel):
     supplierId: int 
     
 class PartsQuoteJobData(BaseModel):
+    tenant: str
+    part_name: str
     vrm: str
     genart: int
     suppliers: List[SupplierDetails]
     
 class CreateTreeJobData(BaseModel):
     vrm: str
+    tenant: str
+    
+class RepairDetailsJobData(BaseModel):
+    vrm: str
+    awNumbers: List[str]
     tenant: str
     
   

@@ -25,6 +25,7 @@ import aiohttp
 import pickle
 import tempfile
 import sys
+from job_queue import job_queue, JobStatus
 
 load_dotenv()
 
@@ -70,6 +71,10 @@ global REPAIR_DESCRIPTIONS
 global bm25
 global annoy_index
 global full_repair_tree
+global api_call_count
+
+# Limit concurrent tree building operations to prevent resource exhaustion
+TREE_BUILD_SEMAPHORE = asyncio.Semaphore(1)  # Only 1 concurrent build at a time
 
 def pickle_object(obj, filename):
     """Serializes a Python object to a file."""
@@ -163,19 +168,19 @@ def download_from_supabase(vrm: str):
         logger.info(f"Downloading repair tree data for VRM: {vrm} from Supabase")
         
         # Download repair tree
-        tree_file = f"{vrm}_repair_tree.json"
-        tree_data = supabase.storage.from_("repair_tasks").download(f"json/{tree_file}")
+        tree_fd, tree_file = tempfile.mkstemp(suffix=".json", prefix=f"{vrm}_repair_tree_")
         temp_files.append(tree_file)
-        with open(tree_file, "wb") as f:
+        tree_data = supabase.storage.from_("repair_tasks").download(f"json/{vrm}_repair_tree.json")
+        with os.fdopen(tree_fd, "wb") as f:
             f.write(tree_data)
         with open(tree_file, "r") as f:
             full_repair_tree = json.load(f)
         
         # Download repair tasks
-        tasks_file = f"{vrm}_repair_tasks.json"
-        tasks_data = supabase.storage.from_("repair_tasks").download(f"json/{tasks_file}")
+        tasks_fd, tasks_file = tempfile.mkstemp(suffix=".json", prefix=f"{vrm}_repair_tasks_")
         temp_files.append(tasks_file)
-        with open(tasks_file, "wb") as f:
+        tasks_data = supabase.storage.from_("repair_tasks").download(f"json/{vrm}_repair_tasks.json")
+        with os.fdopen(tasks_fd, "wb") as f:
             f.write(tasks_data)
         with open(tasks_file, "r") as f:
             json_repair_tasks = json.load(f)
@@ -183,19 +188,19 @@ def download_from_supabase(vrm: str):
         REPAIR_DESCRIPTIONS = json_repair_tasks["descriptions"]
         
         # Download Annoy index
-        annoy_file = f"{vrm}_annoy_index.ann"
-        annoy_data = supabase.storage.from_("repair_tasks").download(f"ann/{annoy_file}")
+        annoy_fd, annoy_file = tempfile.mkstemp(suffix=".ann", prefix=f"{vrm}_annoy_index_")
         temp_files.append(annoy_file)
-        with open(annoy_file, "wb") as f:
+        annoy_data = supabase.storage.from_("repair_tasks").download(f"ann/{vrm}_annoy_index.ann")
+        with os.fdopen(annoy_fd, "wb") as f:
             f.write(annoy_data)
         annoy_index = AnnoyIndex(VECTOR_DIMENSION, METRIC)
         annoy_index.load(annoy_file)
         
         # Download BM25 index
-        bm25_file = f"{vrm}_bm25.pkl"
-        bm25_data = supabase.storage.from_("repair_tasks").download(f"pkl/{bm25_file}")
+        bm25_fd, bm25_file = tempfile.mkstemp(suffix=".pkl", prefix=f"{vrm}_bm25_")
         temp_files.append(bm25_file)
-        with open(bm25_file, "wb") as f:
+        bm25_data = supabase.storage.from_("repair_tasks").download(f"pkl/{vrm}_bm25.pkl")
+        with os.fdopen(bm25_fd, "wb") as f:
             f.write(bm25_data)
         with open(bm25_file, "rb") as f:
             bm25 = pickle.load(f)
@@ -622,11 +627,250 @@ def _validate_repair_descriptions(repair_tasks: List[dict], repair_descriptions:
             )
 
 
+async def _process_tree_build_job(job_id: str, vrm: str, tenant: str):
+    """
+    Background worker function that processes a tree building job.
+    This runs independently and updates job status as it progresses.
+    """
+    try:
+        logger.info(f"[Job {job_id}] Starting tree build for VRM: {vrm}")
+        job_queue.update_job_status(job_id, JobStatus.IN_PROGRESS, progress="Starting tree build...")
+        
+        global REPAIR_TASKS, REPAIR_DESCRIPTIONS, bm25, annoy_index, full_repair_tree, api_call_count
+        api_call_count = 0
+        temp_files = []
+        
+        # Attempt to load from cache
+        try:
+            logger.info(f"[Job {job_id}] Checking cache for VRM: {vrm}")
+            job_queue.update_job_status(job_id, JobStatus.IN_PROGRESS, progress="Checking cache...")
+            
+            cached_tree, cached_annoy, cached_bm25 = download_from_supabase(vrm)
+            
+            if cached_tree:
+                full_repair_tree = cached_tree
+                annoy_index = cached_annoy
+                bm25 = cached_bm25
+                logger.info(f"[Job {job_id}] Successfully loaded from cache")
+                job_queue.update_job_status(
+                    job_id, 
+                    JobStatus.COMPLETED, 
+                    result=cached_tree,
+                    progress="Completed (loaded from cache)"
+                )
+                return
+                
+        except Exception as e:
+            logger.info(f"[Job {job_id}] Cache miss, building from scratch: {e}")
+            job_queue.update_job_status(job_id, JobStatus.IN_PROGRESS, progress="Cache miss, fetching from API...")
+        
+        # Build tree from scratch
+        root_node_structure = {
+            "awNumber": "root",
+            "description": "Root Node",
+            "parentNodeId": None,
+            "childTasks": []
+        }
+        
+        # Fetch tree structure via async API calls
+        job_queue.update_job_status(job_id, JobStatus.IN_PROGRESS, progress="Fetching repair tree from API...")
+        
+        connector = aiohttp.TCPConnector(
+            limit=MAX_CONCURRENT_CONNECTIONS,
+            limit_per_host=MAX_CONNECTIONS_PER_HOST,
+            ttl_dns_cache=300
+        )
+        
+        timeout = aiohttp.ClientTimeout(total=None)
+        
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            root_node_structure["childTasks"] = await _dfs_async(
+                "root", "", vrm, tenant, session
+            )
+        
+        logger.info(f"[Job {job_id}] Successfully fetched tree structure")
+        
+        # Extract and validate tasks
+        job_queue.update_job_status(job_id, JobStatus.IN_PROGRESS, progress="Extracting repair tasks...")
+        REPAIR_TASKS = extract_tasks_dfs(root_node_structure.get("childTasks", []))
+        REPAIR_DESCRIPTIONS = [task["description"] for task in REPAIR_TASKS]
+        
+        if not REPAIR_TASKS:
+            logger.warning(f"[Job {job_id}] No repair tasks found")
+            job_queue.update_job_status(
+                job_id, 
+                JobStatus.COMPLETED, 
+                result=root_node_structure,
+                progress="Completed (no tasks found)"
+            )
+            return
+        
+        _validate_repair_descriptions(REPAIR_TASKS, REPAIR_DESCRIPTIONS)
+        logger.info(f"[Job {job_id}] Extracted {len(REPAIR_TASKS)} repair tasks")
+        
+        # Build search indexes
+        job_queue.update_job_status(
+            job_id, 
+            JobStatus.IN_PROGRESS, 
+            progress=f"Building search indexes for {len(REPAIR_TASKS)} tasks... (this may take several minutes)"
+        )
+        
+        bm25, annoy_index = _build_search_indexes(vrm, REPAIR_DESCRIPTIONS)
+        logger.info(f"[Job {job_id}] Successfully built search indexes")
+        
+        # Save artifacts
+        job_queue.update_job_status(job_id, JobStatus.IN_PROGRESS, progress="Saving to Supabase...")
+        temp_files = _save_repair_tree_artifacts(
+            vrm, root_node_structure, REPAIR_TASKS, 
+            REPAIR_DESCRIPTIONS, bm25, annoy_index
+        )
+        
+        full_repair_tree = root_node_structure
+        logger.info(f"[Job {job_id}] Successfully completed tree build")
+        
+        # Mark job as completed
+        job_queue.update_job_status(
+            job_id, 
+            JobStatus.COMPLETED, 
+            result=root_node_structure,
+            progress="Completed successfully"
+        )
+        
+        # Cleanup temp files
+        if temp_files:
+            _cleanup_temp_files(temp_files)
+            
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        logger.error(f"[Job {job_id}] Error: {error_msg}")
+        logger.error(traceback.format_exc())
+        job_queue.update_job_status(
+            job_id, 
+            JobStatus.FAILED, 
+            error=error_msg,
+            progress="Failed"
+        )
+
+
+@app.post("/jobs/create-tree")
+async def submit_tree_build_job(data: CreateTreeJobData) -> dict:
+    """
+    Submit a repair tree building job to the background queue.
+    Returns immediately with a job ID that can be used to check status.
+    
+    This is the RECOMMENDED endpoint for production use as it:
+    - Doesn't block the API
+    - Prevents timeout issues
+    - Allows monitoring of progress
+    - Handles concurrent requests gracefully
+    
+    Args:
+        data: CreateTreeJobData containing vrm and tenant information
+        
+    Returns:
+        Dictionary with job_id and status
+        
+    Example response:
+        {
+            "job_id": "123e4567-e89b-12d3-a456-426614174000",
+            "status": "pending",
+            "message": "Job submitted successfully. Use /jobs/status/{job_id} to check progress."
+        }
+    """
+    # Validate input
+    if not data.vrm or not data.vrm.strip():
+        raise HTTPException(status_code=400, detail="VRM is required")
+    
+    # Create job in queue
+    job_id = job_queue.create_job(data.vrm, data.tenant)
+    
+    # Start background task
+    asyncio.create_task(_process_tree_build_job(job_id, data.vrm, data.tenant))
+    
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "message": f"Job submitted successfully. Use /jobs/status/{job_id} to check progress.",
+        "status_url": f"/jobs/status/{job_id}",
+        "result_url": f"/jobs/result/{job_id}"
+    }
+
+
+@app.get("/jobs/status/{job_id}")
+async def get_job_status(job_id: str) -> dict:
+    """
+    Get the current status of a job.
+    
+    Args:
+        job_id: The job ID returned from /jobs/create-tree
+        
+    Returns:
+        Job status information including progress
+        
+    Raises:
+        HTTPException: 404 if job not found
+    """
+    job = job_queue.get_job(job_id)
+    
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    return job.to_dict()
+
+
+@app.get("/jobs/result/{job_id}")
+async def get_job_result(job_id: str) -> dict:
+    """
+    Get the result of a completed job.
+    
+    Args:
+        job_id: The job ID returned from /jobs/create-tree
+        
+    Returns:
+        The complete repair tree if job is completed
+        
+    Raises:
+        HTTPException: 
+            - 404 if job not found
+            - 400 if job is not completed yet
+            - 500 if job failed
+    """
+    job = job_queue.get_job(job_id)
+    
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    if job.status == JobStatus.PENDING:
+        raise HTTPException(
+            status_code=400, 
+            detail="Job is still pending. Please wait and check status."
+        )
+    
+    if job.status == JobStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Job is still in progress: {job.progress or 'Processing...'}"
+        )
+    
+    if job.status == JobStatus.FAILED:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Job failed: {job.error or 'Unknown error'}"
+        )
+    
+    return job.result
+
+
 @app.post("/create-tree-async")
 async def build_full_repair_tree(data: CreateTreeJobData) -> dict:
     """
+    [DEPRECATED] Use /jobs/create-tree instead for better performance and reliability.
+    
     Recursively traverse all subnodes starting from root and return the entire tree structure.
     Uses async/await with parallel API calls for dramatic performance improvement.
+    
+    ⚠️ WARNING: This endpoint blocks until completion and may timeout on large trees.
+    For production use, use /jobs/create-tree which returns immediately.
     
     Workflow:
     1. Attempt to load cached tree from Supabase
@@ -645,130 +889,132 @@ async def build_full_repair_tree(data: CreateTreeJobData) -> dict:
     """
     global api_call_count, REPAIR_TASKS, REPAIR_DESCRIPTIONS, bm25, annoy_index, full_repair_tree
     
-    api_call_count = 0
-    temp_files = []
-    
-    try:
-        # Validate input
-        if not data.vrm or not data.vrm.strip():
-            raise HTTPException(status_code=400, detail="VRM is required")
+    # Use semaphore to limit concurrent tree building operations
+    async with TREE_BUILD_SEMAPHORE:
+        api_call_count = 0
+        temp_files = []
         
-        logger.info(f"Building repair tree for VRM: {data.vrm}")
-        
-        # Attempt to load from cache
         try:
-            logger.info(f"Attempting to load cached tree for VRM: {data.vrm}")
-            cached_tree, cached_annoy, cached_bm25 = download_from_supabase(data.vrm)
+            # Validate input
+            if not data.vrm or not data.vrm.strip():
+                raise HTTPException(status_code=400, detail="VRM is required")
             
-            if cached_tree:
-                full_repair_tree = cached_tree
-                annoy_index = cached_annoy
-                bm25 = cached_bm25
-                logger.info(f"Successfully loaded cached tree for VRM: {data.vrm}")
-                return cached_tree
+            logger.info(f"Building repair tree for VRM: {data.vrm}")
+            
+            # Attempt to load from cache
+            try:
+                logger.info(f"Attempting to load cached tree for VRM: {data.vrm}")
+                cached_tree, cached_annoy, cached_bm25 = download_from_supabase(data.vrm)
                 
-        except Exception as e:
-            logger.info(f"Cache miss for VRM {data.vrm}, building from scratch: {e}")
-        
-        # Build tree from scratch
-        logger.info(f"Building repair tree from API for VRM: {data.vrm}")
-        
-        root_node_structure = {
-            "awNumber": "root",
-            "description": "Root Node",
-            "parentNodeId": None,
-            "childTasks": []
-        }
-        
-        # Fetch tree structure via async API calls
-        try:
-            # Configure session with connection limits to prevent overwhelming the server
-            connector = aiohttp.TCPConnector(
-                limit=MAX_CONCURRENT_CONNECTIONS,
-                limit_per_host=MAX_CONNECTIONS_PER_HOST,
-                ttl_dns_cache=300  # DNS cache TTL in seconds
-            )
+                if cached_tree:
+                    full_repair_tree = cached_tree
+                    annoy_index = cached_annoy
+                    bm25 = cached_bm25
+                    logger.info(f"Successfully loaded cached tree for VRM: {data.vrm}")
+                    return cached_tree
+                    
+            except Exception as e:
+                logger.info(f"Cache miss for VRM {data.vrm}, building from scratch: {e}")
             
-            timeout = aiohttp.ClientTimeout(total=None)  # No total timeout for the session
+            # Build tree from scratch
+            logger.info(f"Building repair tree from API for VRM: {data.vrm}")
             
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                root_node_structure["childTasks"] = await _dfs_async(
-                    "root", "", data.vrm, data.tenant, session
+            root_node_structure = {
+                "awNumber": "root",
+                "description": "Root Node",
+                "parentNodeId": None,
+                "childTasks": []
+            }
+            
+            # Fetch tree structure via async API calls
+            try:
+                # Configure session with connection limits to prevent overwhelming the server
+                connector = aiohttp.TCPConnector(
+                    limit=MAX_CONCURRENT_CONNECTIONS,
+                    limit_per_host=MAX_CONNECTIONS_PER_HOST,
+                    ttl_dns_cache=300  # DNS cache TTL in seconds
                 )
-        except Exception as e:
-            logger.error(f"Failed to fetch repair tree from API: {e}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to fetch repair tree from external API: {str(e)}"
-            ) from e
-        
-        # Extract and validate tasks
-        try:
-            REPAIR_TASKS = extract_tasks_dfs(root_node_structure.get("childTasks", []))
-            REPAIR_DESCRIPTIONS = [task["description"] for task in REPAIR_TASKS]
+                
+                timeout = aiohttp.ClientTimeout(total=None)  # No total timeout for the session
+                
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    root_node_structure["childTasks"] = await _dfs_async(
+                        "root", "", data.vrm, data.tenant, session
+                    )
+            except Exception as e:
+                logger.error(f"Failed to fetch repair tree from API: {e}")
+                logger.error(traceback.format_exc())
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to fetch repair tree from external API: {str(e)}"
+                ) from e
             
-            if not REPAIR_TASKS:
-                logger.warning(f"No repair tasks found for VRM: {data.vrm}")
-                return root_node_structure
+            # Extract and validate tasks
+            try:
+                REPAIR_TASKS = extract_tasks_dfs(root_node_structure.get("childTasks", []))
+                REPAIR_DESCRIPTIONS = [task["description"] for task in REPAIR_TASKS]
+                
+                if not REPAIR_TASKS:
+                    logger.warning(f"No repair tasks found for VRM: {data.vrm}")
+                    return root_node_structure
+                
+                _validate_repair_descriptions(REPAIR_TASKS, REPAIR_DESCRIPTIONS)
+                
+            except Exception as e:
+                logger.error(f"Failed to extract repair tasks: {e}")
+                logger.error(traceback.format_exc())
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to process repair tasks: {str(e)}"
+                ) from e
             
-            _validate_repair_descriptions(REPAIR_TASKS, REPAIR_DESCRIPTIONS)
+            # Build search indexes
+            try:
+                bm25, annoy_index = _build_search_indexes(data.vrm, REPAIR_DESCRIPTIONS)
+            except Exception as e:
+                logger.error(f"Failed to build search indexes: {e}")
+                logger.error(traceback.format_exc())
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to build search indexes: {str(e)}"
+                ) from e
+            
+            # Save artifacts
+            try:
+                temp_files = _save_repair_tree_artifacts(
+                    data.vrm, root_node_structure, REPAIR_TASKS, 
+                    REPAIR_DESCRIPTIONS, bm25, annoy_index
+                )
+            except Exception as e:
+                logger.error(f"Failed to save artifacts: {e}")
+                logger.error(traceback.format_exc())
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to save repair tree artifacts: {str(e)}"
+                ) from e
+            
+            full_repair_tree = root_node_structure
+            logger.info(f"Successfully built and saved repair tree for VRM: {data.vrm}")
+            
+            return root_node_structure
+            
+        except HTTPException:
+            # Re-raise HTTP exceptions as-is
+            raise
             
         except Exception as e:
-            logger.error(f"Failed to extract repair tasks: {e}")
+            # Catch any unexpected errors
+            logger.error(f"Unexpected error in build_full_repair_tree: {e}")
             logger.error(traceback.format_exc())
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to process repair tasks: {str(e)}"
+                detail=f"An unexpected error occurred: {str(e)}"
             ) from e
-        
-        # Build search indexes
-        try:
-            bm25, annoy_index = _build_search_indexes(data.vrm, REPAIR_DESCRIPTIONS)
-        except Exception as e:
-            logger.error(f"Failed to build search indexes: {e}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to build search indexes: {str(e)}"
-            ) from e
-        
-        # Save artifacts
-        try:
-            temp_files = _save_repair_tree_artifacts(
-                data.vrm, root_node_structure, REPAIR_TASKS, 
-                REPAIR_DESCRIPTIONS, bm25, annoy_index
-            )
-        except Exception as e:
-            logger.error(f"Failed to save artifacts: {e}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to save repair tree artifacts: {str(e)}"
-            ) from e
-        
-        full_repair_tree = root_node_structure
-        logger.info(f"Successfully built and saved repair tree for VRM: {data.vrm}")
-        
-        return root_node_structure
-        
-    except HTTPException:
-        # Re-raise HTTP exceptions as-is
-        raise
-        
-    except Exception as e:
-        # Catch any unexpected errors
-        logger.error(f"Unexpected error in build_full_repair_tree: {e}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(
-            status_code=500,
-            detail=f"An unexpected error occurred: {str(e)}"
-        ) from e
-        
-    finally:
-        # Clean up temporary files
-        if temp_files:
-            _cleanup_temp_files(temp_files)
+            
+        finally:
+            # Clean up temporary files
+            if temp_files:
+                _cleanup_temp_files(temp_files)
 
 
 async def _fetch_repair_subnodes_async(
@@ -1040,14 +1286,14 @@ def haynes_pro(job_data: HaynesProJobData):
         maintenace_services_response = requests.get(f"{DOMAIN}/api/v1/RepairTree/{job_data.vrm}/services/{chosen_service_json['serviceId']} ",headers=GLOBAL_HEADERS)
         log_haynes_pro_request(job_data.tenant, "Repair Tree Maintenance Services", job_data.vrm, f"{DOMAIN}", maintenace_services_response.url, datetime.now().isoformat())
         maintenance_services = maintenace_services_response.json()
-        maintenance_periods = {period["id"]:period["name"] for period in maintenance_services}
+        maintenance_periods = [{"id": period["id"], "name": period["name"], "time": period["time"]} for period in maintenance_services]
         print(f"maintenance services: {maintenance_services}")
 
         days_since_last_service = (datetime.now() - datetime.strptime(job_data.last_service_date, "%Y-%m-%d")).days
         
         chosen_maintenance_period = gen_model.models.generate_content(
             model="gemini-2.0-flash",
-            contents=f"given the following maintenance periods: {maintenance_periods}, and given the vehicle has {job_data.mileage} miles and its last service was {days_since_last_service} days ago, return the most appropriate maintenance period. Return only the id and name of the maintenance period in a json format.",
+            contents=f"given the following maintenance periods: {maintenance_periods}, and given the vehicle has {job_data.mileage} miles and its last service was {days_since_last_service} days ago, return the most appropriate maintenance period. Return only the id, name, and time fields of the maintenance period in a json format.",
         )
         log_haynes_pro_request(job_data.tenant, "Gemini Maintenance Period Selection", job_data.vrm, f"https://generativelanguage.googleapis.com/v1beta/", "https://generativelanguage.googleapis.com/v1beta/{model=models/*}:generateContent", datetime.now().isoformat())
         print(chosen_maintenance_period.text)
@@ -1062,7 +1308,7 @@ def haynes_pro(job_data: HaynesProJobData):
         print(f"maintenance tasks: {maintenance_tasks}")
         maintenance_tasks = check_maintenance_period(maintenance_tasks, days_since_last_service, int(job_data.mileage))
         #print(f"maintenance tasks: {maintenance_tasks}")
-        results_list.append({"system_id": chosen_service_json['serviceId'], "period_id": chosen_maintenance_period_json['id'], "maintenance_tasks": maintenance_tasks, "period_name": chosen_maintenance_period_json['name']})
+        results_list.append({"system_id": chosen_service_json['serviceId'], "period_id": chosen_maintenance_period_json['id'], "maintenance_tasks": maintenance_tasks, "period_name": chosen_maintenance_period_json['name'], "period_time": chosen_maintenance_period_json['time']})
         return {
         "results": results_list,
         "tree_structure": {},
@@ -1126,10 +1372,13 @@ def get_parts_quotes(job_data: PartsQuoteJobData):
             
         with open("sample_quotes_response.json", "r") as f:
             sample_quotes_response = json.load(f)
+        
+        if job_data.genart not in parts_quotes.keys():
+            job_data.genart = "placeholder"
             
         parts_quotes_response = gen_model.models.generate_content(
             model="gemini-2.0-flash",
-            contents=f"We need to generate some dummy parts quotes for the following vehicle: {job_data.vrm}. The supplier ids are {suppliers_data}. Use the following image urls and brands for the parts. {parts_quotes[str(job_data.genart)]} Return the parts quotes in a json format. {sample_quotes_response}",
+            contents=f"We need to generate some dummy parts quotes for the parts {job_data.part_name} for the following vehicle: {job_data.vrm}. The supplier ids are {suppliers_data}. Use the following image urls and brands for the parts. {parts_quotes[str(job_data.genart)]} Return the parts quotes in a json format. {sample_quotes_response}",
         )
         log_haynes_pro_request(job_data.tenant, "Gemini Parts Quotes Generation", job_data.vrm, f"https://generativelanguage.googleapis.com/v1beta/", "https://generativelanguage.googleapis.com/v1beta/{model=models/*}:generateContent", datetime.now().isoformat())
         print(parts_quotes_response.text)
@@ -1197,7 +1446,16 @@ def check_maintenance_period(maintenance_tasks: dict, days_since_last_service: i
     result["optionalTasks"] = filtered_tasks
     return result
     
-
+@app.post("/repair-details")
+def get_repair_details(data: RepairDetailsJobData):
+    "takes a list of aw numbers and returns the repair details for each aw number"
+    repair_details = []
+    for aw_number in data.awNumbers:
+        repair_detail_response = requests.get(f"{DOMAIN}/api/v1/RepairTree/{data.vrm}/Task/{aw_number}", headers=GLOBAL_HEADERS)
+        log_haynes_pro_request(data.tenant, "Repair Tree Task Details", data.vrm, f"{DOMAIN}", repair_detail_response.url, datetime.now().isoformat())
+        repair_detail = repair_detail_response.json()
+        repair_details.append(repair_detail)
+    return repair_details
     
 @app.get("/")
 def read_root():
