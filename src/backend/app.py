@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 import uvicorn
 from google import genai
 import requests
@@ -28,6 +28,8 @@ import sys
 from job_queue import job_queue, JobStatus
 import psutil
 import gc
+from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
+
 
 def log_memory_stats():
     """Log current memory usage statistics"""
@@ -339,6 +341,78 @@ def log_haynes_pro_request(tenant_code: str,
     except json.JSONDecodeError:
         print("Error: Received a successful status code but the response was not valid JSON.")
         return None
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def _gemini_generate_with_retry(model_name: str, contents: str):
+    """
+    Helper function to call Gemini API with retry logic using tenacity.
+    Raises exception after max retries for fallback handling.
+    """
+    try:
+        response = gen_model.models.generate_content(
+            model=model_name,
+            contents=contents
+        )
+        return response
+    except Exception as e:
+        logger.error(f"Gemini API call failed with model {model_name}: {e}")
+        raise  # Re-raise to trigger retry
+
+def generate_content_with_fallback(contents: str, primary_model: str = "gemini-2.0-flash", 
+                                   fallback_model: str = "gemini-2.0-flash-lite") -> Any:
+    """
+    Generate content using Gemini API with automatic fallback.
+    
+    Tries primary_model (gemini-2.0-flash) with exponential backoff retries.
+    If all retries fail, automatically falls back to fallback_model (gemini-1.5-flash).
+    
+    Args:
+        contents: The prompt/content to send to Gemini
+        primary_model: Primary model to try (default: gemini-2.0-flash)
+        fallback_model: Fallback model if primary fails (default: gemini-1.5-flash)
+        
+    Returns:
+        Gemini API response object
+        
+    Raises:
+        Exception: If both primary and fallback models fail
+    """
+    try:
+        logger.info(f"Attempting Gemini API call with {primary_model}")
+        response = _gemini_generate_with_retry(primary_model, contents)
+        logger.info(f"Successfully generated content with {primary_model}")
+        return response
+        
+    except RetryError as e:
+        # All retries exhausted for primary model
+        logger.warning(
+            f"Primary model {primary_model} failed after all retries. "
+            f"Falling back to {fallback_model}..."
+        )
+        
+        try:
+            # Try fallback model (single attempt, no retry)
+            response = gen_model.models.generate_content(
+                model=fallback_model,
+                contents=contents
+            )
+            logger.info(f"Successfully generated content with fallback model {fallback_model}")
+            return response
+            
+        except Exception as fallback_error:
+            logger.error(
+                f"Fallback model {fallback_model} also failed: {fallback_error}. "
+                f"Original error: {e}"
+            )
+            raise Exception(
+                f"Both {primary_model} and {fallback_model} failed. "
+                f"Fallback error: {str(fallback_error)}"
+            ) from fallback_error
+    
+    except Exception as e:
+        # Unexpected error not caught by retry logic
+        logger.error(f"Unexpected error in generate_content_with_fallback: {e}")
+        raise
 
 def auth() -> str:
     """
@@ -1318,16 +1392,15 @@ def extract_tasks_dfs(repair_tree_json):
 
 @app.post("/haynes-pro")
 def haynes_pro(job_data: HaynesProJobData):
-    if "full service" in job_data.workItems[0].title.lower():
+    if "service" in job_data.workItems[0].title.lower():
         results_list = []
         service_systems_response = requests.get(f"{DOMAIN}/api/v1/RepairTree/{job_data.vrm}/services",headers=GLOBAL_HEADERS)
         log_haynes_pro_request(job_data.tenant, "Repair Tree Service Systems", job_data.vrm, f"{DOMAIN}/api/v1/", service_systems_response.url, datetime.now().isoformat())
         service_systems = service_systems_response.json()
         print(f"service systems: {service_systems}")
         
-        chosen_service = gen_model.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=f"We are looking to do a time/mileage maintenance service for this vehicle. It uses {job_data.fuel} fuel and was manufactured in {job_data.manufacture_date}. Given the following service systems: {service_systems}, return the most appropriate service system. Return only the id and name of the service system in a json format.",
+        chosen_service = generate_content_with_fallback(
+            contents=f"We are looking to do a time/mileage maintenance service for this vehicle. It uses {job_data.fuel} fuel and was manufactured in {job_data.manufacture_date}. Given the following service systems: {service_systems}, return the most appropriate service system. Return only the id and name of the service system in a json format."
         )
         print(chosen_service.text)
         log_haynes_pro_request(job_data.tenant, "Gemini Service System Selection", job_data.vrm, f"https://generativelanguage.googleapis.com/v1beta/", "https://generativelanguage.googleapis.com/v1beta/{model=models/*}:generateContent", datetime.now().isoformat())
@@ -1344,9 +1417,8 @@ def haynes_pro(job_data: HaynesProJobData):
 
         days_since_last_service = (datetime.now() - datetime.strptime(job_data.last_service_date, "%Y-%m-%d")).days
         
-        chosen_maintenance_period = gen_model.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=f"given the following maintenance periods: {maintenance_periods}, and given the vehicle has {job_data.mileage} miles and its last service was {days_since_last_service} days ago, return the most appropriate maintenance period. Return only the id, name, and time fields of the maintenance period in a json format.",
+        chosen_maintenance_period = generate_content_with_fallback(
+            contents=f"given the following maintenance periods: {maintenance_periods}, and given the vehicle has {job_data.mileage} miles and its last service was {days_since_last_service} days ago, return the most appropriate maintenance period. Return only the id, name, and time fields of the maintenance period in a json format."
         )
         log_haynes_pro_request(job_data.tenant, "Gemini Maintenance Period Selection", job_data.vrm, f"https://generativelanguage.googleapis.com/v1beta/", "https://generativelanguage.googleapis.com/v1beta/{model=models/*}:generateContent", datetime.now().isoformat())
         print(chosen_maintenance_period.text)
@@ -1404,6 +1476,7 @@ def haynes_pro(job_data: HaynesProJobData):
         "matched_work_items": results_list
     }
     
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=15))
 @app.post("/get-parts-quotes")
 def get_parts_quotes(job_data: PartsQuoteJobData):
     suppliers_data = [supplier.model_dump() for supplier in job_data.suppliers]
@@ -1435,9 +1508,8 @@ def get_parts_quotes(job_data: PartsQuoteJobData):
 						{"id": 6, "name": 'Virtual Tyre Warehouse'},
 						{"id": 7, "name": 'Dingbro'}] 
         
-        parts_quotes_response = gen_model.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=f"We need to generate some dummy parts quotes for the parts {job_data.part_name} for the following vehicle: {job_data.vrm}. The supplier ids are {suppliers_data} to generate data for and these are the supplier_codes that correspond to the ids {supplier_codes}. Use the following image urls and brands for the parts. {parts_quotes[str(job_data.genart)]}. Return 1-4 parts for each supplier. Return the parts quotes in a json format. {sample_quotes_response}",
+        parts_quotes_response = generate_content_with_fallback(
+            contents=f"We need to generate some dummy parts quotes for the parts {job_data.part_name} for the following vehicle: {job_data.vrm}. The supplier ids are {suppliers_data} to generate data for and these are the supplier_codes that correspond to the ids {supplier_codes}. Use the following image urls and brands for the parts. {parts_quotes[str(job_data.genart)]}. Return 1-4 parts for each supplier. Return the parts quotes in a json format. {sample_quotes_response}"
         )
         log_haynes_pro_request(job_data.tenant, "Gemini Parts Quotes Generation", job_data.vrm, f"https://generativelanguage.googleapis.com/v1beta/", "https://generativelanguage.googleapis.com/v1beta/{model=models/*}:generateContent", datetime.now().isoformat())
         print(parts_quotes_response.text)
