@@ -26,6 +26,17 @@ import pickle
 import tempfile
 import sys
 from job_queue import job_queue, JobStatus
+import psutil
+import gc
+
+def log_memory_stats():
+    """Log current memory usage statistics"""
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    logger.info(f"Memory Usage - RSS: {memory_info.rss / 1024 / 1024:.2f} MB, "
+                f"VMS: {memory_info.vms / 1024 / 1024:.2f} MB")
+    logger.info(f"Garbage Collection - Gen0: {gc.get_count()[0]}, "
+                f"Gen1: {gc.get_count()[1]}, Gen2: {gc.get_count()[2]}")
 
 load_dotenv()
 
@@ -75,6 +86,25 @@ global api_call_count
 
 # Limit concurrent tree building operations to prevent resource exhaustion
 TREE_BUILD_SEMAPHORE = asyncio.Semaphore(1)  # Only 1 concurrent build at a time
+
+def _clear_global_indexes():
+    """Explicitly clear global indexes to free memory"""
+    global REPAIR_TASKS, REPAIR_DESCRIPTIONS, bm25, annoy_index, full_repair_tree
+    
+    # Clear large objects
+    if annoy_index is not None:
+        annoy_index.unload()
+        annoy_index = None
+    
+    REPAIR_TASKS = None
+    REPAIR_DESCRIPTIONS = None
+    bm25 = None
+    full_repair_tree = None
+    
+    # Force garbage collection
+    import gc
+    gc.collect()
+    logger.info("Cleared global indexes and forced garbage collection")
 
 def pickle_object(obj, filename):
     """Serializes a Python object to a file."""
@@ -366,6 +396,21 @@ def schedule_auth_refresh():
     timer.daemon = True  # Dies when main thread dies
     timer.start()
     print("Auth refresh scheduled for 23 hours from now")
+    
+async def periodic_job_cleanup():
+    """Background task to clean up old jobs every hour"""
+    while True:
+        await asyncio.sleep(3600)  # Run every hour
+        try:
+            logger.info("Running periodic job queue cleanup...")
+            job_queue.cleanup_old_jobs(max_age_hours=24)
+            
+            # Also force garbage collection
+            import gc
+            gc.collect()
+            log_memory_stats()
+        except Exception as e:
+            logger.error(f"Error during periodic cleanup: {e}")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -377,7 +422,12 @@ async def lifespan(_: FastAPI):
     auth()
     schedule_auth_refresh()
     
+    # Start background job cleanup task
+    cleanup_task = asyncio.create_task(periodic_job_cleanup())
+    
     yield
+    
+    cleanup_task.cancel()
     print("Shutting down...")
     model = None
 
@@ -633,6 +683,7 @@ async def _process_tree_build_job(job_id: str, vrm: str, tenant: str):
     This runs independently and updates job status as it progresses.
     """
     try:
+        log_memory_stats()
         logger.info(f"[Job {job_id}] Starting tree build for VRM: {vrm}")
         job_queue.update_job_status(job_id, JobStatus.IN_PROGRESS, progress="Starting tree build...")
         
@@ -739,6 +790,8 @@ async def _process_tree_build_job(job_id: str, vrm: str, tenant: str):
         # Cleanup temp files
         if temp_files:
             _cleanup_temp_files(temp_files)
+        
+        log_memory_stats()
             
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
