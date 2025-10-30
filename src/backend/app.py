@@ -1429,9 +1429,15 @@ def get_parts_quotes(job_data: PartsQuoteJobData):
         if job_data.genart not in parts_quotes.keys():
             job_data.genart = "placeholder"
             
+        supplier_codes =[{"id": 1, "name": 'Euro Car Parts' },
+						{"id": 2, "name": 'Alliance Automotive Group'},
+						{"id": 5, "name": 'GSF Car Parts'},
+						{"id": 6, "name": 'Virtual Tyre Warehouse'},
+						{"id": 7, "name": 'Dingbro'}] 
+        
         parts_quotes_response = gen_model.models.generate_content(
             model="gemini-2.0-flash",
-            contents=f"We need to generate some dummy parts quotes for the parts {job_data.part_name} for the following vehicle: {job_data.vrm}. The supplier ids are {suppliers_data}. Use the following image urls and brands for the parts. {parts_quotes[str(job_data.genart)]} Return the parts quotes in a json format. {sample_quotes_response}",
+            contents=f"We need to generate some dummy parts quotes for the parts {job_data.part_name} for the following vehicle: {job_data.vrm}. The supplier ids are {suppliers_data} to generate data for and these are the supplier_codes that correspond to the ids {supplier_codes}. Use the following image urls and brands for the parts. {parts_quotes[str(job_data.genart)]}. Return 1-4 parts for each supplier. Return the parts quotes in a json format. {sample_quotes_response}",
         )
         log_haynes_pro_request(job_data.tenant, "Gemini Parts Quotes Generation", job_data.vrm, f"https://generativelanguage.googleapis.com/v1beta/", "https://generativelanguage.googleapis.com/v1beta/{model=models/*}:generateContent", datetime.now().isoformat())
         print(parts_quotes_response.text)
