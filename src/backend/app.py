@@ -82,7 +82,6 @@ bearer_token: Optional[str] = None
 global REPAIR_TASKS
 global REPAIR_DESCRIPTIONS
 global bm25
-global annoy_index
 global full_repair_tree
 global api_call_count
 
@@ -91,13 +90,9 @@ TREE_BUILD_SEMAPHORE = asyncio.Semaphore(1)  # Only 1 concurrent build at a time
 
 def _clear_global_indexes():
     """Explicitly clear global indexes to free memory"""
-    global REPAIR_TASKS, REPAIR_DESCRIPTIONS, bm25, annoy_index, full_repair_tree
+    global REPAIR_TASKS, REPAIR_DESCRIPTIONS, bm25, full_repair_tree
     
     # Clear large objects
-    if annoy_index is not None:
-        annoy_index.unload()
-        annoy_index = None
-    
     REPAIR_TASKS = None
     REPAIR_DESCRIPTIONS = None
     bm25 = None
@@ -186,13 +181,13 @@ def download_from_supabase(vrm: str):
         vrm: Vehicle Registration Mark
         
     Returns:
-        Tuple of (full_repair_tree, annoy_index, bm25) if successful
+        Tuple of (full_repair_tree, bm25) if successful
         
     Raises:
         FileNotFoundError: If the VRM data is not found in Supabase
         RuntimeError: If download or loading fails for other reasons
     """
-    global REPAIR_TASKS, REPAIR_DESCRIPTIONS, annoy_index, bm25, full_repair_tree
+    global REPAIR_TASKS, REPAIR_DESCRIPTIONS, bm25, full_repair_tree
     
     temp_files = []
     
@@ -219,15 +214,6 @@ def download_from_supabase(vrm: str):
         REPAIR_TASKS = json_repair_tasks["tasks"]
         REPAIR_DESCRIPTIONS = json_repair_tasks["descriptions"]
         
-        # Download Annoy index
-        annoy_fd, annoy_file = tempfile.mkstemp(suffix=".ann", prefix=f"{vrm}_annoy_index_")
-        temp_files.append(annoy_file)
-        annoy_data = supabase.storage.from_("repair_tasks").download(f"ann/{vrm}_annoy_index.ann")
-        with os.fdopen(annoy_fd, "wb") as f:
-            f.write(annoy_data)
-        annoy_index = AnnoyIndex(VECTOR_DIMENSION, METRIC)
-        annoy_index.load(annoy_file)
-        
         # Download BM25 index
         bm25_fd, bm25_file = tempfile.mkstemp(suffix=".pkl", prefix=f"{vrm}_bm25_")
         temp_files.append(bm25_file)
@@ -238,7 +224,7 @@ def download_from_supabase(vrm: str):
             bm25 = pickle.load(f)
         
         logger.info(f"Successfully loaded cached data for VRM: {vrm}")
-        return full_repair_tree, annoy_index, bm25
+        return full_repair_tree, bm25
         
     except Exception as e:
         error_msg = str(e)
@@ -358,18 +344,18 @@ def _gemini_generate_with_retry(model_name: str, contents: str):
         logger.error(f"Gemini API call failed with model {model_name}: {e}")
         raise  # Re-raise to trigger retry
 
-def generate_content_with_fallback(contents: str, primary_model: str = "gemini-2.0-flash", 
-                                   fallback_model: str = "gemini-2.0-flash-lite") -> Any:
+def generate_content_with_fallback(contents: str, primary_model: str = "gemini-2.0-flash-lite", 
+                                   fallback_model: str = "gemini-2.0-flash") -> Any:
     """
     Generate content using Gemini API with automatic fallback.
     
-    Tries primary_model (gemini-2.0-flash) with exponential backoff retries.
-    If all retries fail, automatically falls back to fallback_model (gemini-1.5-flash).
+    Tries primary_model (gemini-2.0-flash-lite) with exponential backoff retries.
+    If all retries fail, automatically falls back to fallback_model (gemini-2.0-flash).
     
     Args:
         contents: The prompt/content to send to Gemini
-        primary_model: Primary model to try (default: gemini-2.0-flash)
-        fallback_model: Fallback model if primary fails (default: gemini-1.5-flash)
+        primary_model: Primary model to try (default: gemini-2.0-flash-lite)
+        fallback_model: Fallback model if primary fails (default: gemini-2.0-flash)
         
     Returns:
         Gemini API response object
@@ -427,7 +413,6 @@ def auth() -> str:
     global full_repair_tree
     global model
     global bm25
-    global annoy_index
     
     
     gen_model = genai.Client(api_key=GEMINI_API_KEY)
@@ -536,17 +521,9 @@ def tokenize(text: str) -> List[str]:
     tokens = re.findall(r'\w+', text.lower())
     return tokens
 
-def search_bm25(query_text: str, bm25_index: BM25Okapi, top_k: int = 10) -> List[Dict]:
+def search_matches_hybrid(query_text: str, bm25_index: BM25Okapi, top_k: int = 10) -> List[Dict]:
     """
-    Performs a keyword-based BM25 search.
-    
-    Args:
-        query_text: The search query
-        bm25_index: The BM25 index
-        top_k: Number of top results to return
-    
-    Returns:
-        List of dictionaries containing index, awNumber, description, and BM25 score
+    Performs a hybrid search using both BM25 and Annoy indexes.
     """
     global REPAIR_TASKS, REPAIR_DESCRIPTIONS
     
@@ -559,34 +536,30 @@ def search_bm25(query_text: str, bm25_index: BM25Okapi, top_k: int = 10) -> List
     # Get top-k indices
     top_indices = np.argsort(scores)[::-1][:top_k]
     
-    # Format results
-    results = []
-    print(REPAIR_TASKS)
-    for idx in top_indices:
-        results.append({
-            "index": int(idx),
-            "awNumber": REPAIR_TASKS[idx]["awNumber"],
-            "description": REPAIR_DESCRIPTIONS[idx],
-            "bm25_score": float(scores[idx])
-        })
+    repair_descriptions = [REPAIR_DESCRIPTIONS[idx] for idx in top_indices.tolist()]
     
-    return results
-
-def search_annoy_index(query_text, annoy_index, model, top_k=2):
-    """
-    Performs a semantic search against the in-memory Annoy index.
-    """
-    global REPAIR_TASKS, REPAIR_DESCRIPTIONS
+    vectors = model.encode(
+    repair_descriptions,
+    batch_size=64,  # Smaller batch size for better progress and lower memory
+    show_progress_bar=True,  # Disable tqdm in production
+    convert_to_numpy=True
+    )
     
-    # 1. Convert the query text into a vector using the same model
+    annoy_idx = AnnoyIndex(VECTOR_DIMENSION, METRIC)
+    
+    for i, vector in enumerate(vectors):
+        annoy_idx.add_item(i, vector)
+        # Log progress every 100 items
+        if (i + 1) % 100 == 0:
+            logger.info(f"  Added {i + 1}/{len(vectors)} vectors to index...")
+            
+    annoy_idx.build(10)
+    
     query_vector = model.encode(query_text)
 
-    # 2. Perform the Approximate Nearest Neighbors (ANN) Search
-    # get_nns_by_vector returns the internal IDs (indices) and their distances
-    # n=top_k specifies how many nearest neighbors to retrieve
-    indices, distances = annoy_index.get_nns_by_vector(
+    indices, distances = annoy_idx.get_nns_by_vector(
         query_vector, 
-        n=top_k, 
+        n=5, 
         include_distances=True
     )
 
@@ -599,19 +572,20 @@ def search_annoy_index(query_text, annoy_index, model, top_k=2):
             "description": REPAIR_DESCRIPTIONS[index],
             "similarity_score": round(1 - distance**2 / 2, 4) # Convert angular distance to cosine similarity
         })
-        
+    
     return results
 
-def _build_search_indexes(vrm: str, repair_descriptions: List[str]) -> tuple[BM25Okapi, AnnoyIndex]:
+
+def _build_bm25_index(vrm: str, repair_descriptions: List[str]) -> BM25Okapi:
     """
-    Build BM25 and Annoy search indexes from repair descriptions.
+    Build BM25 index from repair descriptions.
     
     Args:
         vrm: Vehicle Registration Mark
         repair_descriptions: List of repair task descriptions
         
     Returns:
-        Tuple of (bm25_index, annoy_index)
+        BM25Okapi index
         
     Raises:
         ValueError: If descriptions are empty or invalid
@@ -625,43 +599,12 @@ def _build_search_indexes(vrm: str, repair_descriptions: List[str]) -> tuple[BM2
         logger.info(f"Tokenizing {len(repair_descriptions)} descriptions for BM25...")
         tokenized_descriptions = []
         for desc in repair_descriptions:
-            parts = desc.split(" -> ")
-            if len(parts) >= 2:
-                tokenized_descriptions.append(tokenize(parts[-2]))
-            else:
-                tokenized_descriptions.append(tokenize(parts[-1] if parts else ""))
+            tokenized_descriptions.append(tokenize(desc))
         
         bm25_index = BM25Okapi(tokenized_descriptions)
         logger.info(f"✓ Built BM25 index with {len(tokenized_descriptions)} descriptions")
         
-        # Build Annoy index
-        logger.info(f"Encoding {len(repair_descriptions)} descriptions with sentence transformer...")
-        logger.info("This may take several minutes for large repair trees...")
-        
-        # Encode with optimized batch size and show progress
-        # Note: show_progress_bar is set to False to avoid tqdm output in production logs
-        vectors = model.encode(
-            repair_descriptions,
-            batch_size=64,  # Smaller batch size for better progress and lower memory
-            show_progress_bar=True,  # Disable tqdm in production
-            convert_to_numpy=True
-        )
-        
-        logger.info(f"✓ Encoded {len(vectors)} vectors, building Annoy index...")
-        
-        annoy_idx = AnnoyIndex(VECTOR_DIMENSION, METRIC)
-        
-        for i, vector in enumerate(vectors):
-            annoy_idx.add_item(i, vector)
-            # Log progress every 100 items
-            if (i + 1) % 100 == 0:
-                logger.info(f"  Added {i + 1}/{len(vectors)} vectors to index...")
-        
-        logger.info(f"Building Annoy index tree structure (this may take a minute)...")
-        annoy_idx.build(NUM_TREES)
-        logger.info(f"✓ Built Annoy index with {len(vectors)} vectors and {NUM_TREES} trees")
-        
-        return bm25_index, annoy_idx
+        return bm25_index
         
     except Exception as e:
         logger.error(f"Failed to build search indexes: {e}")
@@ -671,7 +614,7 @@ def _build_search_indexes(vrm: str, repair_descriptions: List[str]) -> tuple[BM2
 
 def _save_repair_tree_artifacts(vrm: str, root_node_structure: dict, 
                                 repair_tasks: List[dict], repair_descriptions: List[str],
-                                bm25_index: BM25Okapi, annoy_idx: AnnoyIndex) -> List[str]:
+                                bm25_index: BM25Okapi) -> List[str]:
     """
     Save all repair tree artifacts to files and upload to Supabase.
     
@@ -681,7 +624,6 @@ def _save_repair_tree_artifacts(vrm: str, root_node_structure: dict,
         repair_tasks: List of repair tasks
         repair_descriptions: List of repair descriptions
         bm25_index: BM25 search index
-        annoy_idx: Annoy search index
         
     Returns:
         List of created file paths for cleanup
@@ -698,12 +640,6 @@ def _save_repair_tree_artifacts(vrm: str, root_node_structure: dict,
             json.dump({"tasks": repair_tasks, "descriptions": repair_descriptions}, f)
         created_files.append(tasks_file)
         upload_to_supabase(tasks_file)
-        
-        # Save Annoy index
-        annoy_file = f"{vrm}_annoy_index.ann"
-        annoy_idx.save(annoy_file)
-        created_files.append(annoy_file)
-        upload_to_supabase(annoy_file)
         
         # Save BM25 index
         bm25_file = f"{vrm}_bm25.pkl"
@@ -761,7 +697,7 @@ async def _process_tree_build_job(job_id: str, vrm: str, tenant: str):
         logger.info(f"[Job {job_id}] Starting tree build for VRM: {vrm}")
         job_queue.update_job_status(job_id, JobStatus.IN_PROGRESS, progress="Starting tree build...")
         
-        global REPAIR_TASKS, REPAIR_DESCRIPTIONS, bm25, annoy_index, full_repair_tree, api_call_count
+        global REPAIR_TASKS, REPAIR_DESCRIPTIONS, bm25, full_repair_tree, api_call_count
         api_call_count = 0
         temp_files = []
         
@@ -770,11 +706,10 @@ async def _process_tree_build_job(job_id: str, vrm: str, tenant: str):
             logger.info(f"[Job {job_id}] Checking cache for VRM: {vrm}")
             job_queue.update_job_status(job_id, JobStatus.IN_PROGRESS, progress="Checking cache...")
             
-            cached_tree, cached_annoy, cached_bm25 = download_from_supabase(vrm)
+            cached_tree, cached_bm25 = download_from_supabase(vrm)
             
             if cached_tree:
                 full_repair_tree = cached_tree
-                annoy_index = cached_annoy
                 bm25 = cached_bm25
                 logger.info(f"[Job {job_id}] Successfully loaded from cache")
                 job_queue.update_job_status(
@@ -840,14 +775,14 @@ async def _process_tree_build_job(job_id: str, vrm: str, tenant: str):
             progress=f"Building search indexes for {len(REPAIR_TASKS)} tasks... (this may take several minutes)"
         )
         
-        bm25, annoy_index = _build_search_indexes(vrm, REPAIR_DESCRIPTIONS)
+        bm25 = _build_bm25_index(vrm, REPAIR_DESCRIPTIONS)
         logger.info(f"[Job {job_id}] Successfully built search indexes")
         
         # Save artifacts
         job_queue.update_job_status(job_id, JobStatus.IN_PROGRESS, progress="Saving to Supabase...")
         temp_files = _save_repair_tree_artifacts(
             vrm, root_node_structure, REPAIR_TASKS, 
-            REPAIR_DESCRIPTIONS, bm25, annoy_index
+            REPAIR_DESCRIPTIONS, bm25
         )
         
         full_repair_tree = root_node_structure
@@ -1014,7 +949,7 @@ async def build_full_repair_tree(data: CreateTreeJobData) -> dict:
     Raises:
         HTTPException: 400 for validation errors, 500 for server errors
     """
-    global api_call_count, REPAIR_TASKS, REPAIR_DESCRIPTIONS, bm25, annoy_index, full_repair_tree
+    global api_call_count, REPAIR_TASKS, REPAIR_DESCRIPTIONS, bm25, full_repair_tree
     
     # Use semaphore to limit concurrent tree building operations
     async with TREE_BUILD_SEMAPHORE:
@@ -1035,7 +970,6 @@ async def build_full_repair_tree(data: CreateTreeJobData) -> dict:
                 
                 if cached_tree:
                     full_repair_tree = cached_tree
-                    annoy_index = cached_annoy
                     bm25 = cached_bm25
                     logger.info(f"Successfully loaded cached tree for VRM: {data.vrm}")
                     return cached_tree
@@ -1097,7 +1031,7 @@ async def build_full_repair_tree(data: CreateTreeJobData) -> dict:
             
             # Build search indexes
             try:
-                bm25, annoy_index = _build_search_indexes(data.vrm, REPAIR_DESCRIPTIONS)
+                bm25 = _build_bm25_index(data.vrm, REPAIR_DESCRIPTIONS)
             except Exception as e:
                 logger.error(f"Failed to build search indexes: {e}")
                 logger.error(traceback.format_exc())
@@ -1110,7 +1044,7 @@ async def build_full_repair_tree(data: CreateTreeJobData) -> dict:
             try:
                 temp_files = _save_repair_tree_artifacts(
                     data.vrm, root_node_structure, REPAIR_TASKS, 
-                    REPAIR_DESCRIPTIONS, bm25, annoy_index
+                    REPAIR_DESCRIPTIONS, bm25
                 )
             except Exception as e:
                 logger.error(f"Failed to save artifacts: {e}")
@@ -1445,15 +1379,13 @@ def haynes_pro(job_data: HaynesProJobData):
             global REPAIR_TASKS
             global REPAIR_DESCRIPTIONS
             global bm25
-            global annoy_index
             global full_repair_tree
             
             results_list = []
             
             # Now search for work items
             for work_item in job_data.workItems:
-                category_match = search_bm25(work_item.title, bm25, top_k=100)
-                semantic_match = search_annoy_index(work_item.title, annoy_index, model, top_k=5)
+                semantic_match = search_matches_hybrid(work_item.title, bm25, model, top_k=10)
                 #best_match = find_best_match(work_item.title, REPAIR_TASKS, text_key="description")
                 for match in semantic_match:
                     aw_number = match["awNumber"]
@@ -1479,45 +1411,51 @@ def haynes_pro(job_data: HaynesProJobData):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=15))
 @app.post("/get-parts-quotes")
 def get_parts_quotes(job_data: PartsQuoteJobData):
+    results = {"parts":[], "part_systems":[]}
     suppliers_data = [supplier.model_dump() for supplier in job_data.suppliers]
     if PARTS_SEARCH_AVAILABLE == "true":
         parts_search_url = f"{DOMAIN}/api/v1/findparts/searchbygenart"
-        
-        
-        payload = {
-            "Vrm": job_data.vrm,
-            "Genart": job_data.genart,
-            "Suppliers": suppliers_data
-        }
-        parts_search_response = requests.post(parts_search_url, headers=GLOBAL_HEADERS, json=payload)
-        log_haynes_pro_request(job_data.tenant, "Find Parts by Genart", job_data.vrm, f"{DOMAIN}", parts_search_response.url, datetime.now().isoformat())
-        return parts_search_response.json()
+        for genart in job_data.genart:
+            payload = {
+                "Vrm": job_data.vrm,
+                "Genart": genart,
+                "Suppliers": suppliers_data
+            }
+            parts_search_response = requests.post(parts_search_url, headers=GLOBAL_HEADERS, json=payload)
+            log_haynes_pro_request(job_data.tenant, "Find Parts by Genart", job_data.vrm, f"{DOMAIN}", parts_search_response.url, datetime.now().isoformat())
+            results["parts"].append(parts_search_response.json()["parts"])
+            if parts_search_response.json()["partSystems"]:
+                results["part_systems"].extend(parts_search_response.json()["partSystems"])
+        return results
     else:
         with open("parts_quotes.json", "r") as f:
             parts_quotes = json.load(f)
             
         with open("sample_quotes_response.json", "r") as f:
             sample_quotes_response = json.load(f)
-        
-        if job_data.genart not in parts_quotes.keys():
-            job_data.genart = "placeholder"
             
         supplier_codes =[{"id": 1, "name": 'Euro Car Parts' },
 						{"id": 2, "name": 'Alliance Automotive Group'},
 						{"id": 5, "name": 'GSF Car Parts'},
 						{"id": 6, "name": 'Virtual Tyre Warehouse'},
 						{"id": 7, "name": 'Dingbro'}] 
+        for index, part_name in enumerate(job_data.part_name):
+            
+            if job_data.genart[index] not in parts_quotes.keys():
+                job_data.genart[index] = "placeholder"
+                
+            parts_quotes_response = generate_content_with_fallback(
+                contents=f"We need to generate some dummy parts quotes for the parts {part_name} for the following vehicle: {job_data.vrm}. The supplier ids are {suppliers_data} to generate data for and these are the supplier_codes that correspond to the ids {supplier_codes}. Use the following image urls and brands for the parts. {parts_quotes[str(job_data.genart[index])]}. Return 1-4 parts for each supplier. Return the parts quotes in a json format. {sample_quotes_response}"
+            )
+            log_haynes_pro_request(job_data.tenant, "Gemini Parts Quotes Generation", job_data.vrm, f"https://generativelanguage.googleapis.com/v1beta/", "https://generativelanguage.googleapis.com/v1beta/{model=models/*}:generateContent", datetime.now().isoformat())
+            print(parts_quotes_response.text)
+            parts_quotes_response_json = json.loads(parts_quotes_response.text.split("```json")[1].split("```")[0])
+            print(f"parts quotes response json: {parts_quotes_response_json}")
+            results["parts"].append(parts_quotes_response_json)
+            if parts_quotes_response_json["partSystems"]:
+                results["part_systems"].extend(parts_quotes_response_json["partSystems"])
+        return results
         
-        parts_quotes_response = generate_content_with_fallback(
-            contents=f"We need to generate some dummy parts quotes for the parts {job_data.part_name} for the following vehicle: {job_data.vrm}. The supplier ids are {suppliers_data} to generate data for and these are the supplier_codes that correspond to the ids {supplier_codes}. Use the following image urls and brands for the parts. {parts_quotes[str(job_data.genart)]}. Return 1-4 parts for each supplier. Return the parts quotes in a json format. {sample_quotes_response}"
-        )
-        log_haynes_pro_request(job_data.tenant, "Gemini Parts Quotes Generation", job_data.vrm, f"https://generativelanguage.googleapis.com/v1beta/", "https://generativelanguage.googleapis.com/v1beta/{model=models/*}:generateContent", datetime.now().isoformat())
-        print(parts_quotes_response.text)
-        
-        parts_quotes_response_json = json.loads(parts_quotes_response.text.split("```json")[1].split("```")[0])
-        print(f"parts quotes response json: {parts_quotes_response_json}")
-        
-        return parts_quotes_response_json
  
 def check_maintenance_period(maintenance_tasks: dict, days_since_last_service: int, mileage: int) -> dict:
     """

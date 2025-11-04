@@ -12,9 +12,9 @@ class SupplierDetails(BaseModel):
     
 class PartsQuoteJobData(BaseModel):
     tenant: str
-    part_name: str
+    part_name: List[str]
     vrm: str
-    genart: int
+    genart: List[int]
     suppliers: List[SupplierDetails]
     
 class CreateTreeJobData(BaseModel):
