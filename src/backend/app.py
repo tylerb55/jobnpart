@@ -537,6 +537,8 @@ def search_matches_hybrid(query_text: str, bm25_index: BM25Okapi, top_k: int = 1
     top_indices = np.argsort(scores)[::-1][:top_k]
     
     repair_descriptions = [REPAIR_DESCRIPTIONS[idx] for idx in top_indices.tolist()]
+    repair_tasks = [REPAIR_TASKS[idx] for idx in top_indices.tolist()]
+    print(f"repair descriptions: {repair_descriptions}")
     
     vectors = model.encode(
     repair_descriptions,
@@ -568,8 +570,8 @@ def search_matches_hybrid(query_text: str, bm25_index: BM25Okapi, top_k: int = 1
     for index, distance in zip(indices, distances):
         results.append({
             "index": index,
-            "awNumber": REPAIR_TASKS[index]["awNumber"],
-            "description": REPAIR_DESCRIPTIONS[index],
+            "awNumber": repair_tasks[index]["awNumber"],
+            "description": repair_descriptions[index],
             "similarity_score": round(1 - distance**2 / 2, 4) # Convert angular distance to cosine similarity
         })
     
@@ -1385,7 +1387,7 @@ def haynes_pro(job_data: HaynesProJobData):
             
             # Now search for work items
             for work_item in job_data.workItems:
-                semantic_match = search_matches_hybrid(work_item.title, bm25, model, top_k=10)
+                semantic_match = search_matches_hybrid(work_item.title, bm25, top_k=10)
                 #best_match = find_best_match(work_item.title, REPAIR_TASKS, text_key="description")
                 for match in semantic_match:
                     aw_number = match["awNumber"]
